@@ -164,7 +164,10 @@ void Processor::start()
             return;
           }
 	  worker->center.create_file_event(listen_socket.fd(), EVENT_READABLE,
-					   listen_handler); }
+					   listen_handler); //}
+	  if (listen_socket.unix_fd() != -1)
+	    worker->center.create_file_event(listen_socket.unix_fd(), EVENT_READABLE,
+                                             listen_handler); }
       }
     }, false);
 }

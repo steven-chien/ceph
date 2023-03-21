@@ -56,6 +56,7 @@ class ServerSocketImpl {
   virtual void abort_accept() = 0;
   /// Get file descriptor
   virtual int fd() const = 0;
+  virtual int unix_fd() const = 0;
 };
 /// \endcond
 
@@ -176,6 +177,10 @@ class ServerSocket {
   /// Get file descriptor
   int fd() const {
     return _ssi->fd();
+  }
+
+  int unix_fd() const {
+    return _ssi->unix_fd();
   }
 
   /// get listen/bind addr

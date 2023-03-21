@@ -303,6 +303,7 @@ class RDMAServerSocketImpl : public ServerSocketImpl {
   virtual int accept(ConnectedSocket *s, const SocketOptions &opts, entity_addr_t *out, Worker *w) override;
   virtual void abort_accept() override;
   virtual int fd() const override { return server_setup_socket; }
+  virtual int unix_fd() const override { return -1; }
 };
 
 class RDMAIWARPServerSocketImpl : public RDMAServerSocketImpl {
