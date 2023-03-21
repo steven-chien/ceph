@@ -243,21 +243,15 @@ class PosixServerSocketImpl : public ServerSocketImpl {
 };
 
 int PosixServerSocketImpl::accept(ConnectedSocket *sock, const SocketOptions &opt, entity_addr_t *out, Worker *w) {
-  std::ofstream log("/tmp/logfile.txt", std::ios_base::app | std::ios_base::out);
-  std::ifstream comm("/proc/self/comm");
-  std::string name;
-  getline(comm, name);
   ceph_assert(sock);
   sockaddr_storage ss;
   socklen_t slen = sizeof(ss);
-  int sd = accept_cloexec(_unix_fd, (sockaddr*)&ss, &slen);
   int unix = 1;
+  int sd = accept_cloexec(_unix_fd, (sockaddr*)&ss, &slen);
   if (sd < 0) {
-    log << name << " accepting unix fd=" << _unix_fd << " fail, ";
     int err = -ceph_sock_errno();
     sd = accept_cloexec(_fd, (sockaddr*)&ss, &slen);
     if (sd < 0) {
-      log << name << " accepting tcp fd=" << _fd << " fail \n ";
       return err;
     }
     unix = 0;
@@ -268,7 +262,6 @@ int PosixServerSocketImpl::accept(ConnectedSocket *sock, const SocketOptions &op
     struct sockaddr_un peeraddr;
     socklen_t peeraddrlen = sizeof(peeraddr);
     getsockname(sd, (struct sockaddr*)&peeraddr, &peeraddrlen);
-    log << name << " accepted unix socket fd=" << _unix_fd << "\n"; //" " << peeraddr.sun_path << "\n";
     int r = fcntl(sd, F_SETFL, fcntl(sd, F_GETFL, 0) | O_NONBLOCK);
     if (r < 0) {
       ::close(sd);
@@ -286,7 +279,6 @@ int PosixServerSocketImpl::accept(ConnectedSocket *sock, const SocketOptions &op
     struct sockaddr_in peeraddr;
     socklen_t peeraddrlen = sizeof(peeraddr);
     getsockname(sd, (struct sockaddr*)&peeraddr, &peeraddrlen);
-    log << name << " accepted tcp socket fd=" << _fd << " " << inet_ntoa(peeraddr.sin_addr) << ":" << htons(peeraddr.sin_port) << "\n";
     int r = handler.set_nonblock(sd);
     if (r < 0) {
       ::close(sd);
@@ -298,11 +290,11 @@ int PosixServerSocketImpl::accept(ConnectedSocket *sock, const SocketOptions &op
       ::close(sd);
       return -ceph_sock_errno();
     }
-
-    out->set_type(addr_type);
-    out->set_sockaddr((sockaddr*)&ss);
-    handler.set_priority(sd, opt.priority, out->get_family());
   }
+
+  out->set_type(addr_type);
+  out->set_sockaddr((sockaddr*)&ss);
+  handler.set_priority(sd, opt.priority, out->get_family());
 
   ceph_assert(NULL != out); //out should not be NULL in accept connection
 
@@ -320,10 +312,6 @@ int PosixWorker::listen(entity_addr_t &sa,
 			const SocketOptions &opt,
                         ServerSocket *sock)
 {
-  std::ofstream log("/tmp/logfile.txt", std::ios_base::app | std::ios_base::out);
-  std::ifstream comm("/proc/self/comm");
-  std::string name;
-  getline(comm, name);
   int listen_sd = net.create_socket(sa.get_family(), true);
   if (listen_sd < 0) {
     return -ceph_sock_errno();
@@ -361,15 +349,15 @@ int PosixWorker::listen(entity_addr_t &sa,
   int listen_unix_sd = -1;
   listen_unix_sd = socket(AF_UNIX, SOCK_STREAM, 0);
   assert(listen_unix_sd != -1);
+
   struct sockaddr_un unix_addr;
   memset(&unix_addr, 0, sizeof(struct sockaddr_un));
-  snprintf(unix_addr.sun_path, sizeof(unix_addr.sun_path) - 1, "/mnt/local/ceph/build/sockets/sock.%d", sa.get_port());
+  const char *tmp_path = std::getenv("TMPDIR") == NULL ? "/tmp" : std::getenv("TMPDIR");
+  snprintf(unix_addr.sun_path, sizeof(unix_addr.sun_path) - 1, "%s/ceph_sock.%d", tmp_path, sa.get_port());
   unix_addr.sun_family = AF_UNIX;
 
   if (remove(unix_addr.sun_path) == -1 && errno != ENOENT) {
     r = -ceph_sock_errno();
-    log << name << " unable to delete existing " << std::string(unix_addr.sun_path)
-                   << ": " << cpp_strerror(r) << "\n";
     ::close(listen_unix_sd);
     return r;
   }
@@ -388,15 +376,10 @@ int PosixWorker::listen(entity_addr_t &sa,
     return -ceph_sock_errno();
   }
 
-  r = fcntl(listen_unix_sd, F_SETFL, fcntl(listen_unix_sd, F_GETFL, 0) | O_NONBLOCK);
-  assert(r == 0);
-
   r = ::bind(listen_unix_sd, (struct sockaddr *) &unix_addr, sizeof(struct sockaddr_un));
   assert(listen_unix_sd != -1);
   if (r < 0) {
     r = -ceph_sock_errno();
-    log << name << " unable to bind to " << std::string(unix_addr.sun_path)
-                   << ": " << cpp_strerror(r) << "\n";
     ::close(listen_unix_sd);
     return r;
   }
@@ -405,14 +388,9 @@ int PosixWorker::listen(entity_addr_t &sa,
   assert(listen_unix_sd != -1);
   if (r < 0) {
     r = -ceph_sock_errno();
-    log << name << " unable to listen on " << std::string(unix_addr.sun_path) << ": " << cpp_strerror(r) << "\n";
     ::close(listen_unix_sd);
     return r;
   }
-
-  log << name << " listening on " << std::string(unix_addr.sun_path) << " fd=" << listen_unix_sd << "\n";
-  struct sockaddr_in *t = (struct sockaddr_in*)(sa.get_sockaddr());
-  log << name << " listening on " << inet_ntoa(t->sin_addr) << ":" << ntohs(t->sin_port) << " fd=" << listen_sd << "\n";
 
   *sock = ServerSocket(
           std::unique_ptr<PosixServerSocketImpl>(
