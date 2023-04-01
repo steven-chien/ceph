@@ -328,6 +328,9 @@ public:
 
   std::set<client_t> client_reclaim_gather;
 
+  const bufferlist& get_snap_trace(Session *session, SnapRealm *realm) const;
+  const bufferlist& get_snap_trace(client_t client, SnapRealm *realm) const;
+
 private:
   friend class MDSContinuation;
   friend class ServerContext;
@@ -503,6 +506,8 @@ private:
   unsigned delegate_inos_pct = 0;
   uint64_t dir_max_entries = 0;
   int64_t bal_fragment_size_max = 0;
+
+  double inject_rename_corrupt_dentry_first = 0.0;
 
   DecayCounter recall_throttle;
   time last_recall_state;

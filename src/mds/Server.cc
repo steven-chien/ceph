@@ -255,6 +255,7 @@ void Server::create_logger()
 Server::Server(MDSRank *m, MetricsHandler *metrics_handler) :
   mds(m), 
   mdcache(mds->mdcache), mdlog(mds->mdlog),
+  inject_rename_corrupt_dentry_first(g_conf().get_val<double>("mds_inject_rename_corrupt_dentry_first")),
   recall_throttle(g_conf().get_val<double>("mds_recall_max_decay_rate")),
   metrics_handler(metrics_handler)
 {
@@ -1318,6 +1319,9 @@ void Server::handle_conf_change(const std::set<std::string>& changed) {
     dout(20) << __func__ << " max fragment size changed to "
             << bal_fragment_size_max << dendl;
   }
+  if (changed.count("mds_inject_rename_corrupt_dentry_first")) {
+    inject_rename_corrupt_dentry_first = g_conf().get_val<double>("mds_inject_rename_corrupt_dentry_first");
+  }
 }
 
 /*
@@ -2342,7 +2346,7 @@ void Server::set_trace_dist(const ref_t<MClientReply> &reply,
       realm = in->find_snaprealm();
     else
       realm = dn->get_dir()->get_inode()->find_snaprealm();
-    reply->snapbl = realm->get_snap_trace();
+    reply->snapbl = get_snap_trace(session, realm);
     dout(10) << "set_trace_dist snaprealm " << *realm << " len=" << reply->snapbl.length() << dendl;
   }
 
@@ -4783,7 +4787,7 @@ void Server::handle_client_readdir(MDRequestRef& mdr)
   //  this isn't perfect, but we should capture the main variable/unbounded size items!
   int front_bytes = dirbl.length() + sizeof(__u32) + sizeof(__u8)*2;
   int bytes_left = max_bytes - front_bytes;
-  bytes_left -= realm->get_snap_trace().length();
+  bytes_left -= get_snap_trace(session, realm).length();
 
   // build dir contents
   bufferlist dnbl;
@@ -5158,7 +5162,7 @@ void Server::handle_client_setattr(MDRequestRef& mdr)
   }
 
   // xlock inode
-  if (mask & (CEPH_SETATTR_MODE|CEPH_SETATTR_UID|CEPH_SETATTR_GID|CEPH_SETATTR_BTIME|CEPH_SETATTR_KILL_SGUID|CEPH_SETATTR_FSCRYPT_AUTH))
+  if (mask & (CEPH_SETATTR_MODE|CEPH_SETATTR_UID|CEPH_SETATTR_GID|CEPH_SETATTR_BTIME|CEPH_SETATTR_KILL_SGUID|CEPH_SETATTR_FSCRYPT_AUTH|CEPH_SETATTR_KILL_SUID|CEPH_SETATTR_KILL_SGID))
     lov.add_xlock(&cur->authlock);
   if (mask & (CEPH_SETATTR_MTIME|CEPH_SETATTR_ATIME|CEPH_SETATTR_SIZE|CEPH_SETATTR_FSCRYPT_FILE))
     lov.add_xlock(&cur->filelock);
@@ -5252,10 +5256,20 @@ void Server::handle_client_setattr(MDRequestRef& mdr)
 
   if (mask & CEPH_SETATTR_MODE)
     pi.inode->mode = (pi.inode->mode & ~07777) | (req->head.args.setattr.mode & 07777);
-  else if ((mask & (CEPH_SETATTR_UID|CEPH_SETATTR_GID|CEPH_SETATTR_KILL_SGUID)) &&
-	    S_ISREG(pi.inode->mode) &&
-            (pi.inode->mode & (S_IXUSR|S_IXGRP|S_IXOTH))) {
-    pi.inode->mode &= ~(S_ISUID|S_ISGID);
+  else if ((mask & (CEPH_SETATTR_UID|CEPH_SETATTR_GID|CEPH_SETATTR_KILL_SGUID|
+		    CEPH_SETATTR_KILL_SUID|CEPH_SETATTR_KILL_SGID)) &&
+	    S_ISREG(pi.inode->mode)) {
+    if (mask & (CEPH_SETATTR_UID|CEPH_SETATTR_GID|CEPH_SETATTR_KILL_SGUID) &&
+	(pi.inode->mode & (S_IXUSR|S_IXGRP|S_IXOTH))) {
+      pi.inode->mode &= ~(S_ISUID|S_ISGID);
+    } else {
+      if (mask & CEPH_SETATTR_KILL_SUID) {
+        pi.inode->mode &= ~S_ISUID;
+      }
+      if (mask & CEPH_SETATTR_KILL_SGID) {
+        pi.inode->mode &= ~S_ISGID;
+      }
+    }
   }
 
   if (mask & CEPH_SETATTR_MTIME)
@@ -5779,11 +5793,17 @@ int Server::parse_quota_vxattr(string name, string value, quota_info_t *quota)
           return r;
       }
     } else if (name == "quota.max_bytes") {
+      /*
+       * The "quota.max_bytes" must be aligned to 4MB if greater than or
+       * equal to 4MB, otherwise must be aligned to 4KB.
+       */
       string cast_err;
       int64_t q = strict_iec_cast<int64_t>(value, &cast_err);
-      if(!cast_err.empty()) {
+      if(!cast_err.empty() ||
+         (!IS_ALIGNED(q, CEPH_4M_BLOCK_SIZE) &&
+          (q < CEPH_4M_BLOCK_SIZE && !IS_ALIGNED(q, CEPH_4K_BLOCK_SIZE)))) {
         dout(10) << __func__ << ":  failed to parse quota.max_bytes: "
-        << cast_err << dendl;
+                 << cast_err << dendl;
         return -CEPHFS_EINVAL;
       }
       quota->max_bytes = q;
@@ -9486,6 +9506,16 @@ void Server::_rename_prepare(MDRequestRef& mdr,
       mdcache->journal_cow_dentry(mdr.get(), metablob, destdn, CEPH_NOSNAP, 0, destdnl);
 
     destdn->first = mdcache->get_global_snaprealm()->get_newest_seq() + 1;
+    {
+      auto do_corruption = inject_rename_corrupt_dentry_first;
+      if (unlikely(do_corruption > 0.0)) {
+        auto r = ceph::util::generate_random_number(0.0, 1.0);
+        if (r < do_corruption) {
+          dout(0) << "corrupting dn: " << *destdn << dendl;
+          destdn->first = -10;
+        }
+      }
+    }
 
     if (destdn->is_auth())
       metablob->add_primary_dentry(destdn, srci, true, true);
@@ -10977,6 +11007,8 @@ void Server::handle_client_mksnap(MDRequestRef& mdr)
     em.first->second = info;
   newsnap.seq = snapid;
   newsnap.last_created = snapid;
+  newsnap.last_modified = info.stamp;
+  newsnap.change_attr++;
 
   // journal the inode changes
   mdr->ls = mdlog->get_current_segment();
@@ -11067,7 +11099,6 @@ void Server::handle_client_rmsnap(MDRequestRef& mdr)
   }
   snapid_t snapid = diri->snaprealm->resolve_snapname(snapname, diri->ino());
   dout(10) << " snapname " << snapname << " is " << snapid << dendl;
-
   if (!(mdr->locking_state & MutationImpl::ALL_LOCKED)) {
     MutationImpl::LockOpVec lov;
     lov.add_xlock(&diri->snaplock);
@@ -11115,6 +11146,8 @@ void Server::handle_client_rmsnap(MDRequestRef& mdr)
   newnode.snaps.erase(snapid);
   newnode.seq = seq;
   newnode.last_destroyed = seq;
+  newnode.last_modified = mdr->get_op_stamp();
+  newnode.change_attr++;
 
   le->metablob.add_client_req(req->get_reqid(), req->get_oldest_client_tid());
   le->metablob.add_table_transaction(TABLE_SNAP, stid);
@@ -11144,6 +11177,8 @@ void Server::_rmsnap_finish(MDRequestRef& mdr, CInode *diri, snapid_t snapid)
 
   // yay
   mdr->in[0] = diri;
+  mdr->tracei = diri;
+  mdr->snapid = snapid;
   respond_to_request(mdr, 0);
 
   // purge snapshot data
@@ -11249,6 +11284,8 @@ void Server::handle_client_renamesnap(MDRequestRef& mdr)
   auto it = newsnap.snaps.find(snapid);
   ceph_assert(it != newsnap.snaps.end());
   it->second.name = dstname;
+  newsnap.last_modified = mdr->get_op_stamp();
+  newsnap.change_attr++;
 
   // journal the inode changes
   mdr->ls = mdlog->get_current_segment();
@@ -11302,4 +11339,19 @@ void Server::dump_reconnect_status(Formatter *f) const
   f->open_object_section("reconnect_status");
   f->dump_stream("client_reconnect_gather") << client_reconnect_gather;
   f->close_section();
+}
+
+const bufferlist& Server::get_snap_trace(Session *session, SnapRealm *realm) const {
+  ceph_assert(session);
+  ceph_assert(realm);
+  if (session->info.has_feature(CEPHFS_FEATURE_NEW_SNAPREALM_INFO)) {
+    return realm->get_snap_trace_new();
+  } else {
+    return realm->get_snap_trace();
+  }
+}
+
+const bufferlist& Server::get_snap_trace(client_t client, SnapRealm *realm) const {
+  Session *session = mds->sessionmap.get_session(entity_name_t::CLIENT(client.v));
+  return get_snap_trace(session, realm);
 }

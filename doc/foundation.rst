@@ -36,24 +36,22 @@ Premier
 * `Samsung Electronics <https://samsung.com/>`_
 * `SoftIron <https://www.softiron.com/>`_
 * `Western Digital <https://www.wdc.com/>`_
-* `XSKY <https://www.xsky.com/en/>`_
 * `ZTE <https://www.zte.com.cn/global/>`_
 
 General
 -------
 
+* `42on <https://www.42on.com/>`_
 * `ARM <http://www.arm.com/>`_
 * `Canonical <https://www.canonical.com/>`_
 * `Cloudbase Solutions <https://cloudbase.it/>`_
 * `croit <http://www.croit.io/>`_
-* `EasyStack <https://www.easystack.io/>`_
 * `ISS <http://iss-integration.com/>`_
 * `Koor <http://koor.tech/>`_
 * `Linode <https://linode.com/>`_
 * `OSNexus <https://osnexus.com/>`_
 * `Seagate <https://seagate.com/>`_
 * `SinoRail <http://www.sinorail.com/>`_
-* `Vexxhost <https://vexxhost.com>`_
 
 Associate
 ---------
@@ -100,7 +98,6 @@ Members
 * Alex Marangone (DigitalOcean)
 * Carlos Maltzahn (UCSC) - Associate member representative
 * Dan van der Ster (CERN) - Ceph Council representative
-* Haomai Wang (XSKY)
 * James Page (Canonical)
 * Joachim Kraftmayer (Clyso)
 * Josh Durgin (IBM) - Ceph Council representative
@@ -114,7 +111,6 @@ Members
 * Pawel Sadowski (OVH)
 * Vincent Hsu (IBM)
 * Xie Xingguo (ZTE)
-* Zhang Shaowen (China Mobile)
 
 Joining
 =======

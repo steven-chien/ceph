@@ -1512,7 +1512,7 @@ Inode* Client::insert_trace(MetaRequest *request, MetaSession *session)
   // snap trace
   SnapRealm *realm = NULL;
   if (reply->snapbl.length())
-    update_snap_trace(reply->snapbl, &realm);
+    update_snap_trace(session, reply->snapbl, &realm);
 
   ldout(cct, 10) << " hrm " 
 	   << " is_target=" << (int)reply->head.is_target
@@ -5028,8 +5028,31 @@ static bool has_new_snaps(const SnapContext& old_snapc,
   return !new_snapc.snaps.empty() && new_snapc.snaps[0] > old_snapc.seq;
 }
 
+struct SnapRealmInfoMeta {
+  SnapRealmInfoMeta(utime_t last_modified, uint64_t change_attr)
+    : last_modified(last_modified),
+      change_attr(change_attr) {
+  }
 
-void Client::update_snap_trace(const bufferlist& bl, SnapRealm **realm_ret, bool flush)
+  utime_t last_modified;
+  uint64_t change_attr;
+};
+
+static std::pair<SnapRealmInfo, std::optional<SnapRealmInfoMeta>> get_snap_realm_info(
+    MetaSession *session, bufferlist::const_iterator &p) {
+  if (session->mds_features.test(CEPHFS_FEATURE_NEW_SNAPREALM_INFO)) {
+    SnapRealmInfoNew ninfo;
+    decode(ninfo, p);
+    return std::make_pair(ninfo.info, SnapRealmInfoMeta(ninfo.last_modified, ninfo.change_attr));
+  } else {
+    SnapRealmInfo info;
+    decode(info, p);
+    return std::make_pair(info, std::nullopt);
+  }
+}
+
+
+void Client::update_snap_trace(MetaSession *session, const bufferlist& bl, SnapRealm **realm_ret, bool flush)
 {
   SnapRealm *first_realm = NULL;
   ldout(cct, 10) << __func__ << " len " << bl.length() << dendl;
@@ -5038,15 +5061,15 @@ void Client::update_snap_trace(const bufferlist& bl, SnapRealm **realm_ret, bool
 
   auto p = bl.cbegin();
   while (!p.end()) {
-    SnapRealmInfo info;
-    decode(info, p);
+    auto [info, realm_info_meta] = get_snap_realm_info(session, p);
     SnapRealm *realm = get_snap_realm(info.ino());
 
     bool invalidate = false;
 
-    if (info.seq() > realm->seq) {
+    if (info.seq() > realm->seq ||
+        (realm_info_meta && (*realm_info_meta).change_attr > realm->change_attr)) {
       ldout(cct, 10) << __func__ << " " << *realm << " seq " << info.seq() << " > " << realm->seq
-	       << dendl;
+                     << dendl;
 
       if (flush) {
 	// writeback any dirty caps _before_ updating snap list (i.e. with old snap info)
@@ -5074,6 +5097,10 @@ void Client::update_snap_trace(const bufferlist& bl, SnapRealm **realm_ret, bool
       realm->created = info.created();
       realm->parent_since = info.parent_since();
       realm->prior_parent_snaps = info.prior_parent_snaps;
+      if (realm_info_meta) {
+        realm->last_modified = (*realm_info_meta).last_modified;
+        realm->change_attr = (*realm_info_meta).change_attr;
+      }
       realm->my_snaps = info.my_snaps;
       invalidate = true;
     }
@@ -5134,9 +5161,8 @@ void Client::handle_snap(const MConstRef<MClientSnap>& m)
 
   if (m->head.op == CEPH_SNAP_OP_SPLIT) {
     ceph_assert(m->head.split);
-    SnapRealmInfo info;
     auto p = m->bl.cbegin();
-    decode(info, p);
+    auto [info, _] = get_snap_realm_info(session.get(), p);
     ceph_assert(info.ino() == m->head.split);
     
     // flush, then move, ino's.
@@ -5173,7 +5199,7 @@ void Client::handle_snap(const MConstRef<MClientSnap>& m)
     }
   }
 
-  update_snap_trace(m->bl, NULL, m->head.op != CEPH_SNAP_OP_DESTROY);
+  update_snap_trace(session.get(), m->bl, NULL, m->head.op != CEPH_SNAP_OP_DESTROY);
 
   if (realm) {
     for (auto p = to_move.begin(); p != to_move.end(); ++p) {
@@ -5298,7 +5324,7 @@ void Client::handle_cap_import(MetaSession *session, Inode *in, const MConstRef<
 
   // add/update it
   SnapRealm *realm = NULL;
-  update_snap_trace(m->snapbl, &realm);
+  update_snap_trace(session, m->snapbl, &realm);
 
   int issued = m->get_caps();
   int wanted = m->get_wanted();
@@ -5793,7 +5819,8 @@ std::ostream& operator<<(std::ostream &out, const UserPerm& perm) {
 int Client::may_setattr(Inode *in, struct ceph_statx *stx, int mask,
 			const UserPerm& perms)
 {
-  ldout(cct, 20) << __func__ << " " << *in << "; " << perms << dendl;
+  ldout(cct, 20) << __func__ << " " << *in << "; " << perms << " stx_mode: "
+      << hex << stx->stx_mode << " mask:" << mask << dec << dendl;
   int r = _getattr_for_perm(in, perms);
   if (r < 0)
     goto out;
@@ -5816,7 +5843,18 @@ int Client::may_setattr(Inode *in, struct ceph_statx *stx, int mask,
   }
 
   if (mask & CEPH_SETATTR_MODE) {
-    if (perms.uid() != 0 && perms.uid() != in->uid)
+    uint32_t m = ~stx->stx_mode & in->mode; // mode bits removed
+    ldout(cct, 20) << __func__ << " " << *in << " = " << hex << m << dec <<  dendl;
+    if (perms.uid() != 0 && perms.uid() != in->uid &&
+	/*
+	 * Currently the kernel fuse and libfuse code is buggy and
+	 * won't pass the ATTR_KILL_SUID/ATTR_KILL_SGID to ceph-fuse.
+	 * But will just set the ATTR_MODE and at the same time by
+	 * clearing the suid/sgid bits.
+	 *
+	 * Only allow unprivileged users to clear S_ISUID and S_ISUID.
+	 */
+	(m & ~(S_ISUID | S_ISGID)))
       goto out;
 
     gid_t i_gid = (mask & CEPH_SETATTR_GID) ? stx->stx_gid : in->gid;
@@ -7784,13 +7822,7 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
   }
 
   if (in->caps_issued_mask(CEPH_CAP_AUTH_EXCL)) {
-    kill_sguid = mask & (CEPH_SETATTR_SIZE|CEPH_SETATTR_KILL_SGUID);
-
-    mask &= ~CEPH_SETATTR_KILL_SGUID;
-  } else if (mask & CEPH_SETATTR_SIZE) {
-    /* If we don't have Ax, then we must ask the server to clear them on truncate */
-    mask |= CEPH_SETATTR_KILL_SGUID;
-    inode_drop |= CEPH_CAP_AUTH_SHARED;
+    kill_sguid = !!(mask & CEPH_SETATTR_KILL_SGUID);
   }
 
   if (mask & CEPH_SETATTR_UID) {
@@ -7850,11 +7882,18 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
     } else {
       mask &= ~CEPH_SETATTR_MODE;
     }
-  } else if (in->caps_issued_mask(CEPH_CAP_AUTH_EXCL) &&
-             kill_sguid && S_ISREG(in->mode) &&
-	     (in->mode & (S_IXUSR|S_IXGRP|S_IXOTH))) {
-    /* Must squash the any setuid/setgid bits with an ownership change */
-    in->mode &= ~(S_ISUID|S_ISGID);
+  } else if (in->caps_issued_mask(CEPH_CAP_AUTH_EXCL) && S_ISREG(in->mode)) {
+    if (kill_sguid && (in->mode & (S_IXUSR|S_IXGRP|S_IXOTH))) {
+      in->mode &= ~(S_ISUID|S_ISGID);
+    } else {
+      if (mask & CEPH_SETATTR_KILL_SUID) {
+        in->mode &= ~S_ISUID;
+      }
+      if (mask & CEPH_SETATTR_KILL_SGID) {
+        in->mode &= ~S_ISGID;
+      }
+    }
+    mask &= ~(CEPH_SETATTR_KILL_SGUID|CEPH_SETATTR_KILL_SUID|CEPH_SETATTR_KILL_SGID);
     in->mark_caps_dirty(CEPH_CAP_AUTH_EXCL);
   }
 
@@ -8056,6 +8095,10 @@ void Client::stat_to_statx(struct stat *st, struct ceph_statx *stx)
 int Client::__setattrx(Inode *in, struct ceph_statx *stx, int mask,
 		       const UserPerm& perms, InodeRef *inp)
 {
+  if (mask & CEPH_SETATTR_SIZE) {
+    mask |= clear_suid_sgid(in, perms, true);
+  }
+
   int ret = _do_setattr(in, stx, mask, perms, inp);
   if (ret < 0)
    return ret;
@@ -10696,18 +10739,13 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
   if (r < 0)
     return r;
 
-  /* clear the setuid/setgid bits, if any */
-  if (unlikely(in->mode & (S_ISUID|S_ISGID)) && size > 0) {
-    struct ceph_statx stx = { 0 };
-
-    put_cap_ref(in, CEPH_CAP_AUTH_SHARED);
-    r = __setattrx(in, &stx, CEPH_SETATTR_KILL_SGUID, f->actor_perms);
+  put_cap_ref(in, CEPH_CAP_AUTH_SHARED);
+  if (size > 0) {
+    r = clear_suid_sgid(in, f->actor_perms);
     if (r < 0) {
       put_cap_ref(in, CEPH_CAP_FILE_WR);
       return r;
     }
-  } else {
-    put_cap_ref(in, CEPH_CAP_AUTH_SHARED);
   }
 
   if (f->flags & O_DIRECT)
@@ -11222,9 +11260,7 @@ int Client::statfs(const char *path, struct statvfs *stbuf,
    * blocks.  We use 4MB only because it is big enough, and because it
    * actually *is* the (ceph) default block size.
    */
-  const int CEPH_BLOCK_SHIFT = 22;
-  stbuf->f_frsize = 1 << CEPH_BLOCK_SHIFT;
-  stbuf->f_bsize = 1 << CEPH_BLOCK_SHIFT;
+  stbuf->f_frsize = CEPH_4M_BLOCK_SIZE;
   stbuf->f_files = total_files_on_fs;
   stbuf->f_ffree = -1;
   stbuf->f_favail = -1;
@@ -11264,11 +11300,19 @@ int Client::statfs(const char *path, struct statvfs *stbuf,
     // Special case: if there is a size quota set on the Inode acting
     // as the root for this client mount, then report the quota status
     // as the filesystem statistics.
-    const fsblkcnt_t total = quota_root->quota.max_bytes >> CEPH_BLOCK_SHIFT;
-    const fsblkcnt_t used = quota_root->rstat.rbytes >> CEPH_BLOCK_SHIFT;
+    fsblkcnt_t total = quota_root->quota.max_bytes >> CEPH_4M_BLOCK_SHIFT;
+    const fsblkcnt_t used = quota_root->rstat.rbytes >> CEPH_4M_BLOCK_SHIFT;
     // It is possible for a quota to be exceeded: arithmetic here must
     // handle case where used > total.
-    const fsblkcnt_t free = total > used ? total - used : 0;
+    fsblkcnt_t free = total > used ? total - used : 0;
+
+    // For quota size less than 4KB, report the total=used=4KB,free=0
+    // when quota is full and total=free=4KB, used=0 otherwise.
+    if (!total) {
+      total = 1;
+      free = quota_root->quota.max_bytes > quota_root->rstat.rbytes ? 1 : 0;
+      stbuf->f_frsize = CEPH_4K_BLOCK_SIZE;
+    }
 
     stbuf->f_blocks = total;
     stbuf->f_bfree = free;
@@ -11277,10 +11321,11 @@ int Client::statfs(const char *path, struct statvfs *stbuf,
     // General case: report the cluster statistics returned from RADOS. Because
     // multiple pools may be used without one filesystem namespace via
     // layouts, this is the most correct thing we can do.
-    stbuf->f_blocks = stats.kb >> (CEPH_BLOCK_SHIFT - 10);
-    stbuf->f_bfree = stats.kb_avail >> (CEPH_BLOCK_SHIFT - 10);
-    stbuf->f_bavail = stats.kb_avail >> (CEPH_BLOCK_SHIFT - 10);
+    stbuf->f_blocks = stats.kb >> CEPH_4K_BLOCK_SHIFT;
+    stbuf->f_bfree = stats.kb_avail >> CEPH_4K_BLOCK_SHIFT;
+    stbuf->f_bavail = stats.kb_avail >> CEPH_4K_BLOCK_SHIFT;
   }
+  stbuf->f_bsize = stbuf->f_frsize;
 
   return rval;
 }
@@ -11939,12 +11984,12 @@ void Client::refresh_snapdir_attrs(Inode *in, Inode *diri) {
   in->uid = diri->uid;
   in->gid = diri->gid;
   in->nlink = 1;
-  in->mtime = diri->mtime;
-  in->ctime = diri->ctime;
+  in->mtime = diri->snaprealm->last_modified;
+  in->ctime = in->mtime;
+  in->change_attr = diri->snaprealm->change_attr;
   in->btime = diri->btime;
   in->atime = diri->atime;
   in->size = diri->size;
-  in->change_attr = diri->change_attr;
 
   in->dirfragtree.clear();
   in->snapdir_parent = diri;
@@ -14902,6 +14947,46 @@ int Client::ll_sync_inode(Inode *in, bool syncdataonly)
   return _fsync(in, syncdataonly);
 }
 
+int Client::clear_suid_sgid(Inode *in, const UserPerm& perms, bool defer)
+{
+  ldout(cct, 20) << __func__ << " " << *in << "; " << perms << " defer "
+                 << defer << dendl;
+
+  if (!in->is_file()) {
+    return 0;
+  }
+
+  if (likely(!(in->mode & (S_ISUID|S_ISGID)))) {
+    return 0;
+  }
+
+  if (perms.uid() == 0 || perms.uid() == in->uid) {
+    return 0;
+  }
+
+  int mask = 0;
+
+  // always drop the suid
+  if (unlikely(in->mode & S_ISUID)) {
+    mask = CEPH_SETATTR_KILL_SUID;
+  }
+
+  // remove the sgid if S_IXUGO is set or the inode is
+  // is not in the caller's group list.
+  if ((in->mode & S_ISGID) &&
+      ((in->mode & S_IXUGO) || !perms.gid_in_groups(in->gid))) {
+    mask |= CEPH_SETATTR_KILL_SGID;
+  }
+
+  ldout(cct, 20) << __func__ << " mask " << mask << dendl;
+  if (defer) {
+    return mask;
+  }
+
+  struct ceph_statx stx = { 0 };
+  return __setattrx(in, &stx, mask, perms);
+}
+
 int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
@@ -14939,6 +15024,12 @@ int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
   int r = get_caps(fh, CEPH_CAP_FILE_WR, CEPH_CAP_FILE_BUFFER, &have, -1);
   if (r < 0)
     return r;
+
+  r = clear_suid_sgid(in, fh->actor_perms);
+  if (r < 0) {
+    put_cap_ref(in, CEPH_CAP_FILE_WR);
+    return r;
+  }
 
   std::unique_ptr<C_SaferCond> onuninline = nullptr;
   if (mode & FALLOC_FL_PUNCH_HOLE) {
@@ -15044,7 +15135,7 @@ int Client::fallocate(int fd, int mode, loff_t offset, loff_t length)
   if (!mref_reader.is_state_satisfied())
     return -CEPHFS_ENOTCONN;
 
-  tout(cct) << __func__ << " " << " " << fd << mode << " " << offset << " " << length << std::endl;
+  tout(cct) << __func__ << " " << fd << mode << " " << offset << " " << length << std::endl;
 
   std::scoped_lock lock(client_lock);
   Fh *fh = get_filehandle(fd);

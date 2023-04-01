@@ -6,6 +6,7 @@
 import ipaddress
 import json
 import logging
+import os
 import re
 import xml.etree.ElementTree as ET  # noqa: N814
 from subprocess import SubprocessError
@@ -17,7 +18,7 @@ from ..awsauth import S3Auth
 from ..exceptions import DashboardException
 from ..rest_client import RequestException, RestClient
 from ..settings import Settings
-from ..tools import dict_contains_path, dict_get, json_str_to_object
+from ..tools import dict_contains_path, dict_get, json_str_to_object, str_to_bool
 
 try:
     from typing import Any, Dict, List, Optional, Tuple, Union
@@ -656,9 +657,31 @@ class RgwClient(RestClient):
             exit_code, _, err = mgr.send_rgwadmin_command(rgw_update_period_cmd)
             if exit_code > 0:
                 raise DashboardException(e=err, msg='Unable to update period',
-                                         http_status_code=500, component='rgw')
+                                         http_status_code=400, component='rgw')
         except SubprocessError as error:
             raise DashboardException(error, http_status_code=500, component='rgw')
+
+    def edit_realm(self, realm_name: str, new_realm_name: str, default: str = ''):
+        rgw_realm_edit_cmd = []
+        if new_realm_name != realm_name:
+            rgw_realm_edit_cmd = ['realm', 'rename', '--rgw-realm',
+                                  realm_name, '--realm-new-name', new_realm_name]
+            try:
+                exit_code, _, err = mgr.send_rgwadmin_command(rgw_realm_edit_cmd, False)
+                if exit_code > 0:
+                    raise DashboardException(e=err, msg='Unable to edit realm',
+                                             http_status_code=500, component='rgw')
+            except SubprocessError as error:
+                raise DashboardException(error, http_status_code=500, component='rgw')
+        if default and str_to_bool(default):
+            rgw_realm_edit_cmd = ['realm', 'default', '--rgw-realm', new_realm_name]
+            try:
+                exit_code, _, _ = mgr.send_rgwadmin_command(rgw_realm_edit_cmd, False)
+                if exit_code > 0:
+                    raise DashboardException(msg='Unable to set {} as default realm'.format(new_realm_name),  # noqa E501  #pylint: disable=line-too-long
+                                             http_status_code=500, component='rgw')
+            except SubprocessError as error:
+                raise DashboardException(error, http_status_code=500, component='rgw')
 
     def create_zonegroup(self, realm_name: str, zonegroup_name: str,
                          default: bool, master: bool, endpoints: List[str]):
@@ -680,13 +703,12 @@ class RgwClient(RestClient):
             cmd_create_zonegroup_options.append(endpoint)
         rgw_zonegroup_create_cmd += cmd_create_zonegroup_options
         try:
-            exit_code, out, _ = mgr.send_rgwadmin_command(rgw_zonegroup_create_cmd)
+            exit_code, out, err = mgr.send_rgwadmin_command(rgw_zonegroup_create_cmd)
             if exit_code > 0:
-                raise DashboardException('Unable to get realm info',
+                raise DashboardException(e=err, msg='Unable to get realm info',
                                          http_status_code=500, component='rgw')
         except SubprocessError as error:
             raise DashboardException(error, http_status_code=500, component='rgw')
-        self.update_period()
         return out
 
     def list_zonegroups(self):
@@ -724,7 +746,7 @@ class RgwClient(RestClient):
                 for rgw_zonegroup in rgw_zonegroup_list['zonegroups']:
                     zonegroup_info = self.get_zonegroup(rgw_zonegroup)
                     zonegroups_info.append(zonegroup_info)
-                    all_zonegroups_info['zonegroups'] = zonegroups_info  # type: ignore
+                all_zonegroups_info['zonegroups'] = zonegroups_info  # type: ignore
             else:
                 all_zonegroups_info['zonegroups'] = []  # type: ignore
         if 'default_info' in rgw_zonegroup_list and rgw_zonegroup_list['default_info'] != '':
@@ -759,12 +781,13 @@ class RgwClient(RestClient):
             cmd_create_zone_options.append(secret_key)
         rgw_zone_create_cmd += cmd_create_zone_options
         try:
-            exit_code, out, _ = mgr.send_rgwadmin_command(rgw_zone_create_cmd)
+            exit_code, out, err = mgr.send_rgwadmin_command(rgw_zone_create_cmd)
             if exit_code > 0:
-                raise DashboardException(msg='Unable to create zone',
+                raise DashboardException(e=err, msg='Unable to create zone',
                                          http_status_code=500, component='rgw')
         except SubprocessError as error:
             raise DashboardException(error, http_status_code=500, component='rgw')
+
         self.update_period()
         return out
 
@@ -1025,6 +1048,50 @@ class RgwClient(RestClient):
             return []
 
         return roles
+
+    def create_role(self, role_name: str, role_path: str, role_assume_policy_doc: str) -> None:
+        try:
+            json.loads(role_assume_policy_doc)
+        except:  # noqa: E722
+            raise DashboardException('Assume role policy document is not a valid json')
+
+        # valid values:
+        # pylint: disable=C0301
+        # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-iam-role.html#cfn-iam-role-path # noqa: E501
+        if len(role_name) > 64:
+            raise DashboardException(
+                f'Role name "{role_name}" is invalid. Should be 64 characters or less')
+
+        role_name_regex = '[0-9a-zA-Z_+=,.@-]+'
+        if not re.fullmatch(role_name_regex, role_name):
+            raise DashboardException(
+                f'Role name "{role_name}" is invalid. Valid characters are "{role_name_regex}"')
+
+        if not os.path.isabs(role_path):
+            raise DashboardException(
+                f'Role path "{role_path}" is invalid. It should be an absolute path')
+        if role_path[-1] != '/':
+            raise DashboardException(
+                f'Role path "{role_path}" is invalid. It should start and end with a slash')
+        path_regex = '(\u002F)|(\u002F[\u0021-\u007E]+\u002F)'
+        if not re.fullmatch(path_regex, role_path):
+            raise DashboardException(
+                (f'Role path "{role_path}" is invalid.'
+                 f'Role path should follow the pattern "{path_regex}"'))
+
+        rgw_create_role_command = ['role', 'create', '--role-name', role_name, '--path', role_path]
+        if role_assume_policy_doc:
+            rgw_create_role_command += ['--assume-role-policy-doc', f"{role_assume_policy_doc}"]
+
+        code, _roles, _err = mgr.send_rgwadmin_command(rgw_create_role_command,
+                                                       stdout_as_json=False)
+        if code != 0:
+            # pylint: disable=C0301
+            link = 'https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-iam-role.html#cfn-iam-role-path'  # noqa: E501
+            msg = (f'Error creating role with code {code}: '
+                   'Looks like the document has a wrong format.'
+                   f' For more information about the format look at {link}')
+            raise DashboardException(msg=msg, component='rgw')
 
     def perform_validations(self, retention_period_days, retention_period_years, mode):
         try:
