@@ -233,6 +233,11 @@ class PosixServerSocketImpl : public ServerSocketImpl {
     _fd = -1;
     ::close(_unix_fd);
     _unix_fd = -1;
+
+    //char unix_addr[65535];
+    //const char *tmp_path = std::getenv("TMPDIR") == NULL ? "/tmp" : std::getenv("TMPDIR");
+    //snprintf(unix_addr, sizeof(unix_addr) - 1, "%s/%s:%d", tmp_path, listen_addr.get_sockaddr().c_str(), listen_addr.get_port());
+    //remove(unix_addr);
   }
   int fd() const override {
     return _fd;
@@ -352,8 +357,8 @@ int PosixWorker::listen(entity_addr_t &sa,
 
   struct sockaddr_un unix_addr;
   memset(&unix_addr, 0, sizeof(struct sockaddr_un));
-  const char *tmp_path = std::getenv("TMPDIR") == NULL ? "/tmp" : std::getenv("TMPDIR");
-  snprintf(unix_addr.sun_path, sizeof(unix_addr.sun_path) - 1, "%s/ceph_sock.%d", tmp_path, sa.get_port());
+  //const char *tmp_path = std::getenv("TMPDIR") == NULL ? "/var/run/ceph" : std::getenv("TMPDIR");
+  snprintf(unix_addr.sun_path, sizeof(unix_addr.sun_path) - 1, "/var/run/ceph/%s:%d", inet_ntoa(((struct sockaddr_in*)sa.get_sockaddr())->sin_addr), sa.get_port());
   unix_addr.sun_family = AF_UNIX;
 
   if (remove(unix_addr.sun_path) == -1 && errno != ENOENT) {
