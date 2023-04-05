@@ -5111,7 +5111,7 @@ def infer_mon_network(ctx: CephadmContext, mon_eps: List[EndPoint]) -> Optional[
     mon_networks = []
     for net, ifaces in list_networks(ctx).items():
         # build local_ips list for the specified network
-        local_ips: List[str] = []
+        local_ips: List[Union[ipaddress.IPv4Address, ipaddress.IPv6Address]] = []
         for _, ls in ifaces.items():
             local_ips.extend([ipaddress.ip_address(ip) for ip in ls])
 
@@ -5450,12 +5450,22 @@ def prepare_ssh(
     if not ctx.skip_monitoring_stack:
         for t in ['ceph-exporter', 'prometheus', 'grafana', 'node-exporter', 'alertmanager']:
             logger.info('Deploying %s service with default placement...' % t)
-            cli(['orch', 'apply', t])
+            try:
+                cli(['orch', 'apply', t])
+            except RuntimeError:
+                ctx.error_code = -errno.EINVAL
+                logger.error(f'Failed to apply service type {t}. '
+                             'Perhaps the ceph version being bootstrapped does not support it')
 
     if ctx.with_centralized_logging:
         for t in ['loki', 'promtail']:
             logger.info('Deploying %s service with default placement...' % t)
-            cli(['orch', 'apply', t])
+            try:
+                cli(['orch', 'apply', t])
+            except RuntimeError:
+                ctx.error_code = -errno.EINVAL
+                logger.error(f'Failed to apply service type {t}. '
+                             'Perhaps the ceph version being bootstrapped does not support it')
 
 
 def enable_cephadm_mgr_module(

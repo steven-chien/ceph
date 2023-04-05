@@ -753,6 +753,14 @@ class RgwRealm(RESTController):
         except NoRgwDaemonsException as e:
             raise DashboardException(e, http_status_code=404, component='rgw')
 
+    def delete(self, realm_name, daemon_name=None):
+        try:
+            instance = RgwClient.admin_instance(daemon_name)
+            result = instance.delete_realm(realm_name)
+            return result
+        except NoRgwDaemonsException as e:
+            raise DashboardException(e, http_status_code=404, component='rgw')
+
 
 @APIRouter('/rgw/zonegroup', Scope.RGW)
 class RgwZonegroup(RESTController):
@@ -798,6 +806,29 @@ class RgwZonegroup(RESTController):
         except NoRgwDaemonsException as e:
             raise DashboardException(e, http_status_code=404, component='rgw')
 
+    def delete(self, zonegroup_name, delete_pools, daemon_name=None):
+        try:
+            instance = RgwClient.admin_instance(daemon_name)
+            result = instance.delete_zonegroup(zonegroup_name, delete_pools)
+            return result
+        except NoRgwDaemonsException as e:
+            raise DashboardException(e, http_status_code=404, component='rgw')
+
+    @allow_empty_body
+    # pylint: disable=W0613,W0102
+    def set(self, zonegroup_name: str, realm_name: str, new_zonegroup_name: str, default: str = '',
+            master: str = '', zonegroup_endpoints: List[str] = [], add_zones: List[str] = [],
+            remove_zones: List[str] = [], placement_targets: List[Dict[str, str]] = [],
+            daemon_name=None):
+        try:
+            instance = RgwClient.admin_instance()
+            result = instance.edit_zonegroup(realm_name, zonegroup_name, new_zonegroup_name,
+                                             default, master, zonegroup_endpoints, add_zones,
+                                             remove_zones, placement_targets)
+            return result
+        except NoRgwDaemonsException as e:
+            raise DashboardException(e, http_status_code=404, component='rgw')
+
 
 @APIRouter('/rgw/zone', Scope.RGW)
 class RgwZone(RESTController):
@@ -839,6 +870,14 @@ class RgwZone(RESTController):
         try:
             instance = RgwClient.admin_instance()
             result = instance.get_all_zones_info()
+            return result
+        except NoRgwDaemonsException as e:
+            raise DashboardException(e, http_status_code=404, component='rgw')
+
+    def delete(self, zonegroup_name, zone_name, delete_pools, daemon_name=None):
+        try:
+            instance = RgwClient.admin_instance(daemon_name)
+            result = instance.delete_zone(zonegroup_name, zone_name, delete_pools)
             return result
         except NoRgwDaemonsException as e:
             raise DashboardException(e, http_status_code=404, component='rgw')
