@@ -45,6 +45,7 @@ import { ChangePasswordGuardService } from './shared/services/change-password-gu
 import { FeatureTogglesGuardService } from './shared/services/feature-toggles-guard.service';
 import { ModuleStatusGuardService } from './shared/services/module-status-guard.service';
 import { NoSsoGuardService } from './shared/services/no-sso-guard.service';
+import { UpgradeComponent } from './ceph/cluster/upgrade/upgrade.component';
 
 @Injectable()
 export class PerformanceCounterBreadcrumbsResolver extends BreadcrumbsResolver {
@@ -121,7 +122,7 @@ const routes: Routes = [
         path: 'ceph-users',
         component: CRUDTableComponent,
         data: {
-          breadcrumbs: 'Cluster/Users',
+          breadcrumbs: 'Cluster/Ceph Users',
           resource: 'api.cluster.user@1.0'
         }
       },
@@ -129,7 +130,23 @@ const routes: Routes = [
         path: 'cluster/user/create',
         component: CrudFormComponent,
         data: {
-          breadcrumbs: 'Cluster/Users',
+          breadcrumbs: 'Cluster/Ceph Users/Create',
+          resource: 'api.cluster.user@1.0'
+        }
+      },
+      {
+        path: 'cluster/user/import',
+        component: CrudFormComponent,
+        data: {
+          breadcrumbs: 'Cluster/Ceph Users/Import',
+          resource: 'api.cluster.user@1.0'
+        }
+      },
+      {
+        path: 'cluster/user/edit',
+        component: CrudFormComponent,
+        data: {
+          breadcrumbs: 'Cluster/Ceph Users/Edit',
           resource: 'api.cluster.user@1.0'
         }
       },
@@ -221,7 +238,7 @@ const routes: Routes = [
       },
       {
         path: 'monitoring',
-        data: { breadcrumbs: 'Cluster/Monitoring' },
+        data: { breadcrumbs: 'Cluster/Alerts' },
         children: [
           { path: '', redirectTo: 'active-alerts', pathMatch: 'full' },
           {
@@ -265,6 +282,11 @@ const routes: Routes = [
             ]
           }
         ]
+      },
+      {
+        path: 'upgrade',
+        component: UpgradeComponent,
+        data: { breadcrumbs: 'Cluster/Upgrade' }
       },
       {
         path: 'perf_counters/:type/:id',

@@ -16,16 +16,14 @@ NFS_POOL_NAME = '.nfs'  # should match mgr_module.py
 # TODO Add test for cluster update when ganesha can be deployed on multiple ports.
 class TestNFS(MgrTestCase):
     def _cmd(self, *args):
-        return self.mgr_cluster.mon_manager.raw_cluster_cmd(*args)
+        return self.get_ceph_cmd_stdout(args)
 
     def _nfs_cmd(self, *args):
         return self._cmd("nfs", *args)
 
     def _nfs_complete_cmd(self, cmd):
-        return self.mgr_cluster.mon_manager.run_cluster_cmd(args=f"nfs {cmd}",
-                                                            stdout=StringIO(),
-                                                            stderr=StringIO(),
-                                                            check_status=False)
+        return self.run_ceph_cmd(args=f"nfs {cmd}", stdout=StringIO(),
+                                 stderr=StringIO(), check_status=False)
 
     def _orch_cmd(self, *args):
         return self._cmd("orch", *args)
@@ -142,7 +140,7 @@ class TestNFS(MgrTestCase):
         :param cmd_args: nfs command arguments to be run
         '''
         cmd_func()
-        ret = self.mgr_cluster.mon_manager.raw_cluster_cmd_result(*cmd_args)
+        ret = self.get_ceph_cmd_result(*cmd_args)
         if ret != 0:
             self.fail("Idempotency test failed")
 
@@ -826,7 +824,9 @@ class TestNFS(MgrTestCase):
         """
         Test that nfs exports can't be created with invalid path
         """
-        self._test_create_cluster()
+        mnt_pt = '/mnt'
+        preserve_mode = self._sys_cmd(['stat', '-c', '%a', mnt_pt])
+        self._create_cluster_with_fs(self.fs_name, mnt_pt)
         try:
             self._create_export(export_id='123',
                                 extra_cmd=['--pseudo-path', self.pseudo_path,
@@ -834,7 +834,7 @@ class TestNFS(MgrTestCase):
         except CommandFailedError as e:
             if e.exitstatus != errno.ENOENT:
                 raise
-        self._test_delete_cluster()
+        self._delete_cluster_with_fs(self.fs_name, mnt_pt, preserve_mode)
 
     def test_nfs_export_creation_at_filepath(self):
         """
@@ -850,8 +850,7 @@ class TestNFS(MgrTestCase):
                                                             '--path',
                                                             '/testfile'])
         except CommandFailedError as e:
-            # NotADirectoryError is raised as EINVAL
-            if e.exitstatus != errno.EINVAL:
+            if e.exitstatus != errno.ENOTDIR:
                 raise
         self.ctx.cluster.run(args=['rm', '-rf', '/mnt/testfile'])
         self._delete_cluster_with_fs(self.fs_name, mnt_pt, preserve_mode)
@@ -864,16 +863,16 @@ class TestNFS(MgrTestCase):
         preserve_mode = self._sys_cmd(['stat', '-c', '%a', mnt_pt])
         self._create_cluster_with_fs(self.fs_name, mnt_pt)
         self.ctx.cluster.run(args=['mkdir', f'{mnt_pt}/testdir'])
-        self.ctx.cluster.run(args=['ln', '-s', 'testdir', 'testdir_symlink'],
-                             cwd=f'{mnt_pt}')
+        self.ctx.cluster.run(args=['ln', '-s', f'{mnt_pt}/testdir',
+                                   f'{mnt_pt}/testdir_symlink'])
         try:
             self._create_export(export_id='123',
                                 extra_cmd=['--pseudo-path',
                                            self.pseudo_path,
                                            '--path',
-                                           f'{mnt_pt}/testdir_symlink'])
+                                           '/testdir_symlink'])
         except CommandFailedError as e:
-            if e.exitstatus != errno.ENOENT:
+            if e.exitstatus != errno.ENOTDIR:
                 raise
         self.ctx.cluster.run(args=['rm', '-rf', f'{mnt_pt}/*'])
         self._delete_cluster_with_fs(self.fs_name, mnt_pt, preserve_mode)

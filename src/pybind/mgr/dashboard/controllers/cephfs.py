@@ -331,8 +331,9 @@ class CephFS(RESTController):
             raise cherrypy.HTTPError(404,
                                      "Client {0} does not exist in cephfs {1}".format(client_id,
                                                                                       fs_id))
+        filters = [f'id={client_id}']
         CephService.send_command('mds', 'client evict',
-                                 srv_spec='{0}:0'.format(fs_id), id=client_id)
+                                 srv_spec='{0}:0'.format(fs_id), filters=filters)
 
     @staticmethod
     def _cephfs_instance(fs_id):
@@ -502,7 +503,11 @@ class CephFSClients(object):
 
     @ViewCache()
     def get(self):
-        return CephService.send_command('mds', 'session ls', srv_spec='{0}:0'.format(self.fscid))
+        try:
+            ret = CephService.send_command('mds', 'session ls', srv_spec='{0}:0'.format(self.fscid))
+        except RuntimeError:
+            ret = []
+        return ret
 
 
 @UIRouter('/cephfs', Scope.CEPHFS)

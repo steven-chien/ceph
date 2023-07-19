@@ -550,6 +550,8 @@ MDSRank::MDSRank(
                                          cct->_conf->mds_op_log_threshold);
   op_tracker.set_history_size_and_duration(cct->_conf->mds_op_history_size,
                                            cct->_conf->mds_op_history_duration);
+  op_tracker.set_history_slow_op_size_and_threshold(cct->_conf->mds_op_history_slow_op_size,
+                                                    cct->_conf->mds_op_history_slow_op_threshold);
 
   schedule_update_timer_task();
 }
@@ -743,6 +745,7 @@ void MDSRankDispatcher::tick()
 
   // ...
   if (is_clientreplay() || is_active() || is_stopping()) {
+    server->clear_laggy_clients();
     server->find_idle_sessions();
     server->evict_cap_revoke_non_responders();
     locker->tick();
@@ -1178,6 +1181,7 @@ bool MDSRank::is_valid_message(const cref_t<Message> &m) {
       type == CEPH_MSG_CLIENT_RECONNECT ||
       type == CEPH_MSG_CLIENT_RECLAIM ||
       type == CEPH_MSG_CLIENT_REQUEST ||
+      type == CEPH_MSG_CLIENT_REPLY ||
       type == MSG_MDS_PEER_REQUEST ||
       type == MSG_MDS_HEARTBEAT ||
       type == MSG_MDS_TABLE_REQUEST ||
@@ -1231,6 +1235,7 @@ void MDSRank::handle_message(const cref_t<Message> &m)
       ALLOW_MESSAGES_FROM(CEPH_ENTITY_TYPE_CLIENT);
       // fall-thru
     case CEPH_MSG_CLIENT_REQUEST:
+    case CEPH_MSG_CLIENT_REPLY:
       server->dispatch(m);
       break;
     case MSG_MDS_PEER_REQUEST:
@@ -2986,13 +2991,6 @@ void MDSRank::command_scrub_start(Formatter *f,
   }
 
   std::lock_guard l(mds_lock);
-  if (scrub_mdsdir) {
-    MDSGatherBuilder gather(g_ceph_context);
-    mdcache->enqueue_scrub("~mdsdir", "", false, true, false, scrub_mdsdir,
-                           f, gather.new_sub());
-    gather.set_finisher(new C_MDSInternalNoop);
-    gather.activate();
-  }
   mdcache->enqueue_scrub(path, tag, force, recursive, repair, scrub_mdsdir,
                          f, on_finish);
   // scrub_dentry() finishers will dump the data for us; we're done!
@@ -3846,6 +3844,9 @@ void MDSRankDispatcher::handle_conf_change(const ConfigProxy& conf, const std::s
   }
   if (changed.count("mds_op_history_size") || changed.count("mds_op_history_duration")) {
     op_tracker.set_history_size_and_duration(conf->mds_op_history_size, conf->mds_op_history_duration);
+  }
+  if (changed.count("mds_op_history_slow_op_size") || changed.count("mds_op_history_slow_op_threshold")) {
+    op_tracker.set_history_slow_op_size_and_threshold(conf->mds_op_history_slow_op_size, conf->mds_op_history_slow_op_threshold);
   }
   if (changed.count("mds_enable_op_tracker")) {
     op_tracker.set_tracking(conf->mds_enable_op_tracker);

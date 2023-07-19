@@ -30,8 +30,19 @@ except ImportError:
 import yaml
 
 from ceph.deployment import inventory
-from ceph.deployment.service_spec import ServiceSpec, NFSServiceSpec, RGWSpec, \
-    IscsiServiceSpec, IngressSpec, SNMPGatewaySpec, MDSSpec, TunedProfileSpec
+from ceph.deployment.service_spec import (
+    ArgumentList,
+    ArgumentSpec,
+    GeneralArgList,
+    IngressSpec,
+    IscsiServiceSpec,
+    MDSSpec,
+    NFSServiceSpec,
+    RGWSpec,
+    SNMPGatewaySpec,
+    ServiceSpec,
+    TunedProfileSpec,
+)
 from ceph.deployment.drive_group import DriveGroupSpec
 from ceph.deployment.hostspec import HostSpec, SpecValidationError
 from ceph.utils import datetime_to_str, str_to_datetime
@@ -589,12 +600,14 @@ class Orchestrator(object):
     def remove_osds(self, osd_ids: List[str],
                     replace: bool = False,
                     force: bool = False,
-                    zap: bool = False) -> OrchResult[str]:
+                    zap: bool = False,
+                    no_destroy: bool = False) -> OrchResult[str]:
         """
         :param osd_ids: list of OSD IDs
         :param replace: marks the OSD as being destroyed. See :ref:`orchestrator-osd-replace`
         :param force: Forces the OSD removal process without waiting for the data to be drained first.
         :param zap: Zap/Erase all devices associated with the OSDs (DESTROYS DATA)
+        :param no_destroy: Do not destroy associated VGs/LVs with the OSD.
 
 
         .. note:: this can only remove OSDs that were successfully
@@ -856,6 +869,17 @@ class UpgradeStatusSpec(object):
         self.message = ""  # Freeform description
         self.is_paused: bool = False  # Is the upgrade paused?
 
+    def to_json(self) -> dict:
+        return {
+            'in_progress': self.in_progress,
+            'target_image': self.target_image,
+            'which': self.which,
+            'services_complete': self.services_complete,
+            'progress': self.progress,
+            'message': self.message,
+            'is_paused': self.is_paused,
+        }
+
 
 def handle_type_error(method: FuncT) -> FuncT:
     @wraps(method)
@@ -930,8 +954,8 @@ class DaemonDescription(object):
                  deployed_by: Optional[List[str]] = None,
                  rank: Optional[int] = None,
                  rank_generation: Optional[int] = None,
-                 extra_container_args: Optional[List[str]] = None,
-                 extra_entrypoint_args: Optional[List[str]] = None,
+                 extra_container_args: Optional[GeneralArgList] = None,
+                 extra_entrypoint_args: Optional[GeneralArgList] = None,
                  ) -> None:
 
         #: Host is at the same granularity as InventoryHost
@@ -996,8 +1020,23 @@ class DaemonDescription(object):
 
         self.is_active = is_active
 
-        self.extra_container_args = extra_container_args
-        self.extra_entrypoint_args = extra_entrypoint_args
+        self.extra_container_args: Optional[ArgumentList] = None
+        self.extra_entrypoint_args: Optional[ArgumentList] = None
+        if extra_container_args:
+            self.extra_container_args = ArgumentSpec.from_general_args(
+                extra_container_args)
+        if extra_entrypoint_args:
+            self.extra_entrypoint_args = ArgumentSpec.from_general_args(
+                extra_entrypoint_args)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if value is not None and name in ('extra_container_args', 'extra_entrypoint_args'):
+            for v in value:
+                tname = str(type(v))
+                if 'ArgumentSpec' not in tname:
+                    raise TypeError(f"{name} is not all ArgumentSpec values: {v!r}(is {type(v)} in {value!r}")
+
+        super().__setattr__(name, value)
 
     @property
     def status(self) -> Optional[DaemonDescriptionStatus]:
@@ -1369,7 +1408,7 @@ class InventoryFilter(object):
 
     Typical use:
 
-      filter by host when presentig UI workflow for configuring
+      filter by host when presenting UI workflow for configuring
       a particular server.
       filter by label when not all of estate is Ceph servers,
       and we want to only learn about the Ceph servers.
@@ -1569,7 +1608,7 @@ class OrchestratorClientMixin(Orchestrator):
 
     >>> import mgr_module
     >>> #doctest: +SKIP
-    ... class MyImplentation(mgr_module.MgrModule, Orchestrator):
+    ... class MyImplementation(mgr_module.MgrModule, Orchestrator):
     ...     def __init__(self, ...):
     ...         self.orch_client = OrchestratorClientMixin()
     ...         self.orch_client.set_mgr(self.mgr))
@@ -1577,7 +1616,7 @@ class OrchestratorClientMixin(Orchestrator):
 
     def set_mgr(self, mgr: MgrModule) -> None:
         """
-        Useable in the Dashbord that uses a global ``mgr``
+        Useable in the Dashboard that uses a global ``mgr``
         """
 
         self.__mgr = mgr  # Make sure we're not overwriting any other `mgr` properties

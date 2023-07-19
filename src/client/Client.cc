@@ -72,6 +72,7 @@
 
 #include "mds/flock.h"
 #include "mds/cephfs_features.h"
+#include "mds/snap.h"
 #include "osd/OSDMap.h"
 #include "osdc/Filer.h"
 
@@ -1209,6 +1210,11 @@ Dentry *Client::insert_dentry_inode(Dir *dir, const string& dname, LeaseStat *dl
     Inode *diri = dir->parent_inode;
     clear_dir_complete_and_ordered(diri, false);
     dn = link(dir, dname, in, dn);
+
+    if (old_dentry) {
+      dn->is_renaming = false;
+      signal_cond_list(waiting_for_rename);
+    }
   }
 
   update_dentry_lease(dn, dlease, from, session);
@@ -1292,7 +1298,8 @@ void Client::clear_dir_complete_and_ordered(Inode *diri, bool complete)
 /*
  * insert results from readdir or lssnap into the metadata cache.
  */
-void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, Inode *diri) {
+void Client::insert_readdir_results(MetaRequest *request, MetaSession *session,
+                                    Inode *diri, Inode *diri_other) {
 
   auto& reply = request->reply;
   ConnectionRef con = request->reply->get_connection();
@@ -1307,7 +1314,8 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
   dir_result_t *dirp = request->dirp;
   ceph_assert(dirp);
 
-  // the extra buffer list is only set for readdir and lssnap replies
+  // the extra buffer list is only set for readdir, lssnap and
+  // readdir_snapdiff replies
   auto p = reply->get_extra_bl().cbegin();
   if (!p.end()) {
     // snapdir?
@@ -1315,10 +1323,27 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
       ceph_assert(diri);
       diri = open_snapdir(diri);
     }
+    bool snapdiff_req = request->head.op == CEPH_MDS_OP_READDIR_SNAPDIFF;
+    frag_t fg;
+    unsigned offset_hash;
+    if (snapdiff_req) {
+      fg = (unsigned)request->head.args.snapdiff.frag;
+      offset_hash = (unsigned)request->head.args.snapdiff.offset_hash;
+    } else {
+      fg = (unsigned)request->head.args.readdir.frag;
+      offset_hash = (unsigned)request->head.args.readdir.offset_hash;
+    }
 
     // only open dir if we're actually adding stuff to it!
     Dir *dir = diri->open_dir();
     ceph_assert(dir);
+    //open opponent dir for snapdiff if any
+    Dir *dir_other = nullptr;
+    if (snapdiff_req) {
+      ceph_assert(diri_other);
+      dir_other = diri_other->open_dir();
+      ceph_assert(dir_other);
+    }
 
     // dirstat
     DirStat dst(p, features);
@@ -1330,7 +1355,6 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
     bool end = ((unsigned)flags & CEPH_READDIR_FRAG_END);
     bool hash_order = ((unsigned)flags & CEPH_READDIR_HASH_ORDER);
 
-    frag_t fg = (unsigned)request->head.args.readdir.frag;
     unsigned readdir_offset = dirp->next_offset;
     string readdir_start = dirp->last_name;
     ceph_assert(!readdir_start.empty() || readdir_offset == 2);
@@ -1341,7 +1365,7 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
 	last_hash = ceph_frag_value(diri->hash_dentry_name(readdir_start));
       } else if (flags & CEPH_READDIR_OFFSET_HASH) {
 	/* mds understands offset_hash */
-	last_hash = (unsigned)request->head.args.readdir.offset_hash;
+	last_hash = offset_hash;
       }
     }
 
@@ -1386,13 +1410,22 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
 
       Inode *in = add_update_inode(&ist, request->sent_stamp, session,
 				   request->perms);
+      auto *effective_dir = dir;
+      auto *effective_diri = diri;
+
+      if (snapdiff_req && in->snapid != diri->snapid) {
+        ceph_assert(diri_other);
+        ceph_assert(dir_other);
+        effective_diri = diri_other;
+        effective_dir = dir_other;
+      }
       Dentry *dn;
-      if (diri->dir->dentries.count(dname)) {
-	Dentry *olddn = diri->dir->dentries[dname];
+      if (effective_dir->dentries.count(dname)) {
+	Dentry *olddn = effective_dir->dentries[dname];
 	if (olddn->inode != in) {
 	  // replace incorrect dentry
 	  unlink(olddn, true, true);  // keep dir, dentry
-	  dn = link(dir, dname, in, olddn);
+	  dn = link(effective_dir, dname, in, olddn);
 	  ceph_assert(dn == olddn);
 	} else {
 	  // keep existing dn
@@ -1401,13 +1434,13 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
 	}
       } else {
 	// new dn
-	dn = link(dir, dname, in, NULL);
+	dn = link(effective_dir, dname, in, NULL);
       }
       dn->alternate_name = std::move(dlease.alternate_name);
 
       update_dentry_lease(dn, &dlease, request->sent_stamp, session);
       if (hash_order) {
-	unsigned hash = ceph_frag_value(diri->hash_dentry_name(dname));
+	unsigned hash = ceph_frag_value(effective_diri->hash_dentry_name(dname));
 	if (hash != last_hash)
 	  readdir_offset = 2;
 	last_hash = hash;
@@ -1416,20 +1449,21 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
 	dn->offset = dir_result_t::make_fpos(fg, readdir_offset++, false);
       }
       // add to readdir cache
-      if (dirp->release_count == diri->dir_release_count &&
-	  dirp->ordered_count == diri->dir_ordered_count &&
-	  dirp->start_shared_gen == diri->shared_gen) {
-	if (dirp->cache_index == dir->readdir_cache.size()) {
+      if (!snapdiff_req &&
+          dirp->release_count == effective_diri->dir_release_count &&
+	  dirp->ordered_count == effective_diri->dir_ordered_count &&
+	  dirp->start_shared_gen == effective_diri->shared_gen) {
+	if (dirp->cache_index == effective_dir->readdir_cache.size()) {
 	  if (i == 0) {
 	    ceph_assert(!dirp->inode->is_complete_and_ordered());
 	    dir->readdir_cache.reserve(dirp->cache_index + numdn);
 	  }
-	  dir->readdir_cache.push_back(dn);
-	} else if (dirp->cache_index < dir->readdir_cache.size()) {
+          effective_dir->readdir_cache.push_back(dn);
+	} else if (dirp->cache_index < effective_dir->readdir_cache.size()) {
 	  if (dirp->inode->is_complete_and_ordered())
-	    ceph_assert(dir->readdir_cache[dirp->cache_index] == dn);
+	    ceph_assert(effective_dir->readdir_cache[dirp->cache_index] == dn);
 	  else
-	    dir->readdir_cache[dirp->cache_index] = dn;
+            effective_dir->readdir_cache[dirp->cache_index] = dn;
 	} else {
 	  ceph_abort_msg("unexpected readdir buffer idx");
 	}
@@ -1449,6 +1483,8 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session, 
 
     if (dir->is_empty())
       close_dir(dir);
+    if (dir_other && dir_other->is_empty())
+      close_dir(dir_other);
   }
 }
 
@@ -1608,10 +1644,20 @@ Inode* Client::insert_trace(MetaRequest *request, MetaSession *session)
   if (in) {
     if (op == CEPH_MDS_OP_READDIR ||
 	op == CEPH_MDS_OP_LSSNAP) {
-      insert_readdir_results(request, session, in);
+      insert_readdir_results(request,
+	session,
+	in,
+	nullptr);
     } else if (op == CEPH_MDS_OP_LOOKUPNAME) {
       // hack: return parent inode instead
       in = diri;
+    } else if (op == CEPH_MDS_OP_READDIR_SNAPDIFF) {
+      // provide both request's inode (aka snapA) and traced one (snapB)
+      // to properly match snapdiff results
+      insert_readdir_results(request,
+	session,
+	request->inode(),
+	in);
     }
 
     if (request->dentry() == NULL && in != request->inode()) {
@@ -1685,7 +1731,7 @@ mds_rank_t Client::choose_target_mds(MetaRequest *req, Inode** phash_diri)
            * I think the MDS should be able to redirect as needed*/
 	  in = in->get_first_parent()->dir->parent_inode;
         else {
-          ldout(cct, 10) << "got unlinked inode, can't look at parent" << dendl;
+          ldout(cct, 10) << __func__ << "got unlinked inode, can't look at parent" << dendl;
           break;
         }
       }
@@ -3421,12 +3467,17 @@ Dentry* Client::link(Dir *dir, const string& name, Inode *in, Dentry *dn)
 
     lru.lru_insert_mid(dn);    // mid or top?
 
-    ldout(cct, 15) << "link dir " << dir->parent_inode << " '" << name << "' to inode " << in
-		   << " dn " << dn << " (new dn)" << dendl;
+    if(in) {
+      ldout(cct, 15) << "link dir " << *dir->parent_inode << " '" << name << "' to inode " << *in
+		     << " dn " << *dn << " (new dn)" << dendl;
+    } else {
+      ldout(cct, 15) << "link dir " << *dir->parent_inode << " '" << name << "' "
+        << " dn " << *dn << " (new dn)" << dendl;
+    }
   } else {
     ceph_assert(!dn->inode);
-    ldout(cct, 15) << "link dir " << dir->parent_inode << " '" << name << "' to inode " << in
-		   << " dn " << dn << " (old dn)" << dendl;
+    ldout(cct, 15) << "link dir " << *dir->parent_inode << " '" << name << "' to inode " << in
+		   << " dn " << *dn << " (old dn)" << dendl;
   }
 
   if (in) {    // link to inode
@@ -3529,7 +3580,7 @@ void Client::put_cap_ref(Inode *in, int cap)
     int put_nref = 0;
     int drop = last & ~in->caps_issued();
     if (in->snapid == CEPH_NOSNAP) {
-      if ((last & (CEPH_CAP_FILE_WR | CEPH_CAP_FILE_BUFFER)) &&
+      if ((last & CEPH_CAP_FILE_WR) &&
 	  !in->cap_snaps.empty() &&
 	  in->cap_snaps.rbegin()->second.writing) {
 	ldout(cct, 10) << __func__ << " finishing pending cap_snap on " << *in << dendl;
@@ -3543,6 +3594,10 @@ void Client::put_cap_ref(Inode *in, int cap)
 	signal_cond_list(in->waitfor_commit);
 	ldout(cct, 5) << __func__ << " dropped last FILE_BUFFER ref on " << *in << dendl;
 	++put_nref;
+
+	if (!in->cap_snaps.empty()) {
+	  flush_snaps(in);
+	}
       }
     }
     if (last & CEPH_CAP_FILE_CACHE) {
@@ -4003,15 +4058,13 @@ void Client::queue_cap_snap(Inode *in, SnapContext& old_snapc)
       in->cap_snaps.rbegin()->second.writing) {
     ldout(cct, 10) << __func__ << " already have pending cap_snap on " << *in << dendl;
     return;
-  } else if (in->caps_dirty() ||
-            (used & CEPH_CAP_FILE_WR) ||
-	     (dirty & CEPH_CAP_ANY_WR)) {
+  } else if (dirty || (used & CEPH_CAP_FILE_WR)) {
     const auto &capsnapem = in->cap_snaps.emplace(std::piecewise_construct, std::make_tuple(old_snapc.seq), std::make_tuple(in));
     ceph_assert(capsnapem.second); /* element inserted */
     CapSnap &capsnap = capsnapem.first->second;
     capsnap.context = old_snapc;
     capsnap.issued = in->caps_issued();
-    capsnap.dirty = in->caps_dirty();
+    capsnap.dirty = dirty;
 
     capsnap.dirty_data = (used & CEPH_CAP_FILE_BUFFER);
 
@@ -4058,9 +4111,11 @@ void Client::finish_cap_snap(Inode *in, CapSnap &capsnap, int used)
   }
 
   if (used & CEPH_CAP_FILE_BUFFER) {
-    capsnap.writing = 1;
     ldout(cct, 10) << __func__ << " " << *in << " cap_snap " << &capsnap << " used " << used
-	     << " WRBUFFER, delaying" << dendl;
+	     << " WRBUFFER, trigger to flush dirty buffer" << dendl;
+
+    /* trigger to flush the buffer */
+    _flush(in, new C_Client_FlushComplete(this, in));
   } else {
     capsnap.dirty_data = 0;
     flush_snaps(in);
@@ -5263,24 +5318,48 @@ void Client::handle_caps(const MConstRef<MClientCaps>& m)
 
   got_mds_push(session.get());
 
+  bool do_cap_release = false;
   Inode *in;
   vinodeno_t vino(m->get_ino(), CEPH_NOSNAP);
   if (auto it = inode_map.find(vino); it != inode_map.end()) {
     in = it->second;
-  } else {
-    if (m->get_op() == CEPH_CAP_OP_IMPORT) {
-      ldout(cct, 5) << __func__ << " don't have vino " << vino << " on IMPORT, immediately releasing" << dendl;
-      session->enqueue_cap_release(
-        m->get_ino(),
-        m->get_cap_id(),
-        m->get_seq(),
-        m->get_mseq(),
-        cap_epoch_barrier);
-    } else {
-      ldout(cct, 5) << __func__ << " don't have vino " << vino << ", dropping" << dendl;
-    }
 
-    // in case the mds is waiting on e.g. a revocation
+    /* MDS maybe waiting for cap release with increased seq */
+    switch (m->get_op()) {
+      case CEPH_CAP_OP_REVOKE:
+      case CEPH_CAP_OP_GRANT:
+        if (!in->caps.count(mds)) {
+	  do_cap_release = true;
+          ldout(cct, 5) << __func__ << " vino " << vino << " don't have cap "
+                        << m->get_cap_id() << " op " << m->get_op()
+                        << ", immediately releasing" << dendl;
+	}
+    }
+  } else {
+    /* MDS maybe waiting for cap release with increased seq */
+    switch (m->get_op()) {
+      case CEPH_CAP_OP_IMPORT:
+      case CEPH_CAP_OP_REVOKE:
+      case CEPH_CAP_OP_GRANT:
+	do_cap_release = true;
+        ldout(cct, 5) << __func__ << " don't have vino " << vino << " op "
+                      << m->get_op() << ", immediately releasing" << dendl;
+	break;
+      default:
+        ldout(cct, 5) << __func__ << " don't have vino " << vino << ", dropping" << dendl;
+	return;
+    }
+  }
+
+  // In case the mds is waiting on e.g. a revocation
+  if (do_cap_release) {
+    session->enqueue_cap_release(
+      m->get_ino(),
+      m->get_cap_id(),
+      m->get_seq(),
+      m->get_mseq(),
+      cap_epoch_barrier);
+
     flush_cap_releases();
     return;
   }
@@ -5755,6 +5834,13 @@ void Client::handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const M
 	}
       }
     }
+  }
+
+  // just in case the caps was released just before we get the revoke msg
+  if (!check && m->get_op() == CEPH_CAP_OP_REVOKE) {
+    cap->wanted = 0; // don't let check_caps skip sending a response to MDS
+    check = true;
+    flags = CHECK_CAPS_NODELAY;
   }
 
   if (check)
@@ -6603,11 +6689,18 @@ void Client::_unmount(bool abort)
   }
 
   mount_cond.wait(lock, [this] {
-    if (!mds_requests.empty()) {
-      ldout(cct, 10) << "waiting on " << mds_requests.size() << " requests"
-		     << dendl;
+    // Only wait for write OPs
+    for (auto& [tid, req] : mds_requests) {
+      if (req->is_write()) {
+        ldout(cct, 10) << "waiting for write request '" << tid
+                       << "' to complete, currently there are "
+                       << mds_requests.size()
+                       << " outstanding read/write requests"
+                       << dendl;
+        return false;
+      }
     }
-    return mds_requests.empty();
+    return true;
   });
 
   cwd.reset();
@@ -6620,7 +6713,7 @@ void Client::_unmount(bool abort)
     ldout(cct, 0) << " destroyed lost open file " << fh << " on " << *fh->inode << dendl;
     _release_fh(fh);
   }
-  
+
   while (!ll_unclosed_fh_set.empty()) {
     set<Fh*>::iterator it = ll_unclosed_fh_set.begin();
     Fh *fh = *it;
@@ -6881,6 +6974,13 @@ void Client::collect_and_send_global_metrics() {
   ldout(cct, 20) << __func__ << dendl;
   ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
 
+  /* Do not send the metrics until the MDS rank is ready */
+  if (!mdsmap->is_active((mds_rank_t)0)) {
+    ldout(cct, 5) << __func__ << " MDS rank 0 is not ready yet -- not sending metric"
+                  << dendl;
+    return;
+  }
+
   if (!have_open_session((mds_rank_t)0)) {
     ldout(cct, 5) << __func__ << ": no session with rank=0 -- not sending metric"
                   << dendl;
@@ -7052,7 +7152,8 @@ bool Client::_dentry_valid(const Dentry *dn)
 }
 
 int Client::_lookup(Inode *dir, const string& dname, int mask, InodeRef *target,
-		    const UserPerm& perms, std::string* alternate_name)
+                    const UserPerm& perms, std::string* alternate_name,
+                    bool is_rename)
 {
   int r = 0;
   Dentry *dn = NULL;
@@ -7130,6 +7231,19 @@ relookup:
       }
     } else {
       ldout(cct, 20) << " no cap on " << dn->inode->vino() << dendl;
+    }
+
+    // In rare case during the rename if another thread tries to
+    // lookup the dst dentry, it may get an inconsistent result
+    // that both src dentry and dst dentry will link to the same
+    // inode at the same time.
+    // Will wait the rename to finish and try it again.
+    if (!is_rename && dn->is_renaming) {
+      ldout(cct, 1) << __func__ << " dir " << *dir
+                    << " rename is on the way, will wait for dn '"
+                    << dname << "'" << dendl;
+      wait_on_list(waiting_for_rename);
+      goto relookup;
     }
   } else {
     // can we conclude ENOENT locally?
@@ -9038,7 +9152,8 @@ void Client::_readdir_drop_dirp_buffer(dir_result_t *dirp)
   dirp->buffer.clear();
 }
 
-int Client::_readdir_get_frag(dir_result_t *dirp)
+int Client::_readdir_get_frag(int op, dir_result_t* dirp,
+  fill_readdir_args_cb_t fill_req_cb)
 {
   ceph_assert(dirp);
   ceph_assert(dirp->inode);
@@ -9053,33 +9168,18 @@ int Client::_readdir_get_frag(dir_result_t *dirp)
   ldout(cct, 10) << __func__ << " " << dirp << " on " << dirp->inode->ino << " fg " << fg
 		 << " offset " << hex << dirp->offset << dec << dendl;
 
-  int op = CEPH_MDS_OP_READDIR;
-  if (dirp->inode && dirp->inode->snapid == CEPH_SNAPDIR)
-    op = CEPH_MDS_OP_LSSNAP;
-
   InodeRef& diri = dirp->inode;
 
   MetaRequest *req = new MetaRequest(op);
-  filepath path;
-  diri->make_nosnap_relative_path(path);
-  req->set_filepath(path); 
-  req->set_inode(diri.get());
-  req->head.args.readdir.frag = fg;
-  req->head.args.readdir.flags = CEPH_READDIR_REPLY_BITFLAGS;
-  if (dirp->last_name.length()) {
-    req->path2.set_path(dirp->last_name);
-  } else if (dirp->hash_order()) {
-    req->head.args.readdir.offset_hash = dirp->offset_high();
-  }
-  req->dirp = dirp;
-  
+  fill_req_cb(dirp, req, diri, fg);
+
   bufferlist dirbl;
   int res = make_request(req, dirp->perms, NULL, NULL, -1, &dirbl);
   
   if (res == -CEPHFS_EAGAIN) {
     ldout(cct, 10) << __func__ << " got EAGAIN, retrying" << dendl;
     _readdir_rechoose_frag(dirp);
-    return _readdir_get_frag(dirp);
+    return _readdir_get_frag(op, dirp, fill_req_cb);
   }
 
   if (res == 0) {
@@ -9104,7 +9204,8 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
 {
   ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
   ldout(cct, 10) << __func__ << " " << dirp << " on " << dirp->inode->ino
-	   << " last_name " << dirp->last_name << " offset " << hex << dirp->offset << dec
+	   << " last_name " << dirp->last_name
+	   << " offset " << hex << dirp->offset << dec
 	   << dendl;
   Dir *dir = dirp->inode->dir;
 
@@ -9138,7 +9239,7 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
     }
 
     int idx = pd - dir->readdir_cache.begin();
-    if (dn->inode->is_dir()) {
+    if (dn->inode->is_dir() && cct->_conf->client_dirsize_rbytes) {
       mask |= CEPH_STAT_RSTAT;
     }
     int r = _getattr(dn->inode, mask, dirp->perms);
@@ -9193,10 +9294,60 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
   return 0;
 }
 
-int Client::readdir_r_cb(dir_result_t *d, add_dirent_cb_t cb, void *p,
-			 unsigned want, unsigned flags, bool getref)
+int Client::readdir_r_cb(dir_result_t* d,
+  add_dirent_cb_t cb,
+  void* p,
+  unsigned want,
+  unsigned flags,
+  bool getref)
+{
+  auto fill_readdir_cb = [](dir_result_t* dirp,
+			    MetaRequest* req,
+			    InodeRef& diri,
+			    frag_t fg) {
+    filepath path;
+    diri->make_nosnap_relative_path(path);
+    req->set_filepath(path);
+    req->set_inode(diri.get());
+    req->head.args.readdir.frag = fg;
+    req->head.args.readdir.flags = CEPH_READDIR_REPLY_BITFLAGS;
+    if (dirp->last_name.length()) {
+      req->path2.set_path(dirp->last_name);
+    } else if (dirp->hash_order()) {
+      req->head.args.readdir.offset_hash = dirp->offset_high();
+    }
+    req->dirp = dirp;
+  };
+  int op = CEPH_MDS_OP_READDIR;
+  if (d->inode && d->inode->snapid == CEPH_SNAPDIR)
+    op = CEPH_MDS_OP_LSSNAP;
+  return _readdir_r_cb(op,
+    d,
+    cb,
+    fill_readdir_cb,
+    p,
+    want,
+    flags,
+    getref,
+    false);
+}
+
+//
+// NB: this is used for both readdir and readdir_snapdiff results processing
+// hence it should be request type agnostic
+//
+int Client::_readdir_r_cb(int op,
+  dir_result_t *d,
+  add_dirent_cb_t cb,
+  fill_readdir_args_cb_t fill_cb,
+  void *p,
+  unsigned want,
+  unsigned flags,
+  bool getref,
+  bool bypass_cache)
 {
   int caps = statx_to_mask(flags, want);
+  int rstat_on_dir = cct->_conf->client_dirsize_rbytes ? CEPH_STAT_RSTAT : 0;
 
   RWRef_t mref_reader(mount_state, CLIENT_MOUNTING);
   if (!mref_reader.is_state_satisfied())
@@ -9226,7 +9377,7 @@ int Client::readdir_r_cb(dir_result_t *d, add_dirent_cb_t cb, void *p,
     uint64_t next_off = 1;
 
     int r;
-    r = _getattr(diri, caps | CEPH_STAT_RSTAT, dirp->perms);
+    r = _getattr(diri, caps | rstat_on_dir, dirp->perms);
     if (r < 0)
       return r;
 
@@ -9259,7 +9410,7 @@ int Client::readdir_r_cb(dir_result_t *d, add_dirent_cb_t cb, void *p,
       in = diri->get_first_parent()->dir->parent_inode;
 
     int r;
-    r = _getattr(in, caps | CEPH_STAT_RSTAT, dirp->perms);
+    r = _getattr(in, caps | rstat_on_dir, dirp->perms);
     if (r < 0)
       return r;
 
@@ -9284,12 +9435,14 @@ int Client::readdir_r_cb(dir_result_t *d, add_dirent_cb_t cb, void *p,
   }
 
   // can we read from our cache?
-  ldout(cct, 10) << "offset " << hex << dirp->offset << dec
+  ldout(cct, 10) << __func__
+           << " offset " << hex << dirp->offset << dec
 	   << " snapid " << dirp->inode->snapid << " (complete && ordered) "
 	   << dirp->inode->is_complete_and_ordered()
 	   << " issued " << ccap_string(dirp->inode->caps_issued())
 	   << dendl;
-  if (dirp->inode->snapid != CEPH_SNAPDIR &&
+  if (!bypass_cache &&
+      dirp->inode->snapid != CEPH_SNAPDIR &&
       dirp->inode->is_complete_and_ordered() &&
       dirp->inode->caps_issued_mask(CEPH_CAP_FILE_SHARED, true)) {
     int err = _readdir_cache_cb(dirp, cb, p, caps, getref);
@@ -9303,7 +9456,7 @@ int Client::readdir_r_cb(dir_result_t *d, add_dirent_cb_t cb, void *p,
 
     bool check_caps = true;
     if (!dirp->is_cached()) {
-      int r = _readdir_get_frag(dirp);
+      int r = _readdir_get_frag(op, dirp, fill_cb);
       if (r)
 	return r;
       // _readdir_get_frag () may updates dirp->offset if the replied dirfrag is
@@ -9312,7 +9465,8 @@ int Client::readdir_r_cb(dir_result_t *d, add_dirent_cb_t cb, void *p,
     }
     frag_t fg = dirp->buffer_frag;
 
-    ldout(cct, 10) << "frag " << fg << " buffer size " << dirp->buffer.size()
+    ldout(cct, 10) << __func__
+                   << " frag " << fg << " buffer size " << dirp->buffer.size()
 		   << " offset " << hex << dirp->offset << dendl;
 
     for (auto it = std::lower_bound(dirp->buffer.begin(), dirp->buffer.end(),
@@ -9327,7 +9481,7 @@ int Client::readdir_r_cb(dir_result_t *d, add_dirent_cb_t cb, void *p,
       if (check_caps) {
 	int mask = caps;
 	if(entry.inode->is_dir()){
-          mask |= CEPH_STAT_RSTAT;
+          mask |= rstat_on_dir;
 	}
 	r = _getattr(entry.inode, mask, dirp->perms);
 	if (r < 0)
@@ -9347,7 +9501,9 @@ int Client::readdir_r_cb(dir_result_t *d, add_dirent_cb_t cb, void *p,
       r = cb(p, &de, &stx, next_off, inode);  // _next_ offset
       cl.lock();
 
-      ldout(cct, 15) << " de " << de.d_name << " off " << hex << next_off - 1 << dec
+      ldout(cct, 15) << __func__
+                     << " de " << de.d_name << " off " << hex << next_off - 1 << dec
+                     << " snap " << entry.inode->snapid
 		     << " = " << r << dendl;
       if (r < 0)
 	return r;
@@ -9369,7 +9525,8 @@ int Client::readdir_r_cb(dir_result_t *d, add_dirent_cb_t cb, void *p,
       continue;
     }
 
-    if (diri->shared_gen == dirp->start_shared_gen &&
+    if (!bypass_cache &&
+	diri->shared_gen == dirp->start_shared_gen &&
 	diri->dir_release_count == dirp->release_count) {
       if (diri->dir_ordered_count == dirp->ordered_count) {
 	ldout(cct, 10) << " marking (I_COMPLETE|I_DIR_ORDERED) on " << *diri << dendl;
@@ -9475,6 +9632,81 @@ int Client::readdirplus_r(dir_result_t *d, struct dirent *de,
   return 0;
 }
 
+int Client::readdir_snapdiff(dir_result_t* d1, snapid_t snap2,
+                             struct dirent* out_de,
+                             snapid_t* out_snap)
+{
+  if (!d1 || !d1->inode || d1->inode->snapid == snap2) {
+    lderr(cct) << __func__ << " invalid parameters: "
+               << " d1:" << d1
+               << " d1->inode:" << (d1 ? d1->inode : nullptr)
+               << " snap2 id :" << snap2
+	       << dendl;
+    errno = EINVAL;
+    return -errno;
+  }
+
+  auto& de = d1->de;
+  ceph_statx stx;
+  single_readdir sr;
+  sr.de = &de;
+  sr.stx = &stx;
+  sr.inode = NULL;
+  sr.full = false;
+
+  auto fill_snapdiff_cb = [&](dir_result_t* dirp,
+    MetaRequest* req,
+    InodeRef& diri,
+    frag_t fg) {
+      filepath path;
+      diri->make_nosnap_relative_path(path);
+      req->set_filepath(path);
+      req->set_inode(diri.get());
+      req->head.args.snapdiff.snap_other = snap2;
+      req->head.args.snapdiff.frag = fg;
+      req->head.args.snapdiff.flags = CEPH_READDIR_REPLY_BITFLAGS;
+      if (dirp->last_name.length()) {
+	req->path2.set_path(dirp->last_name);
+      } else if (dirp->hash_order()) {
+	req->head.args.snapdiff.offset_hash = dirp->offset_high();
+      }
+      req->dirp = dirp;
+  };
+
+  // our callback fills the dirent and sets sr.full=true on first
+  // call, and returns -1 the second time around.
+  int ret = _readdir_r_cb(CEPH_MDS_OP_READDIR_SNAPDIFF,
+    d1,
+    _readdir_single_dirent_cb,
+    fill_snapdiff_cb,
+    (void*)&sr,
+    0,
+    AT_STATX_DONT_SYNC,
+    false,
+    true);
+  if (ret < -1) {
+    lderr(cct) << __func__ << " error: "
+               << cpp_strerror(ret)
+               << dendl;
+    errno = -ret;  // this sucks.
+    return ret;
+  }
+
+  ldout(cct, 15) << __func__ << " " << ret
+    << " " << sr.de->d_name
+    << " " << stx.stx_dev
+    << dendl;
+  if (sr.full) {
+    if (out_de) {
+      *out_de = de;
+    }
+    if (out_snap) {
+      *out_snap = stx.stx_dev;
+    }
+    return 1;
+  }
+  return 0;
+}
 
 /* getdents */
 struct getdents_result {
@@ -11776,6 +12008,9 @@ int Client::_sync_fs()
   // flush caps
   flush_caps_sync();
   ceph_tid_t flush_tid = last_flush_tid;
+
+  // flush the mdlog before waiting for unsafe requests.
+  flush_mdlog_sync();
 
   // wait for unsafe mds requests
   wait_unsafe_requests();
@@ -14201,12 +14436,13 @@ int Client::_rename(Inode *fromdir, const char *fromname, Inode *todir, const ch
     req->old_dentry_drop = CEPH_CAP_FILE_SHARED;
     req->old_dentry_unless = CEPH_CAP_FILE_EXCL;
 
+    de->is_renaming = true;
     req->set_dentry(de);
     req->dentry_drop = CEPH_CAP_FILE_SHARED;
     req->dentry_unless = CEPH_CAP_FILE_EXCL;
 
     InodeRef oldin, otherin;
-    res = _lookup(fromdir, fromname, 0, &oldin, perm);
+    res = _lookup(fromdir, fromname, 0, &oldin, perm, nullptr, true);
     if (res < 0)
       goto fail;
 
@@ -14215,7 +14451,7 @@ int Client::_rename(Inode *fromdir, const char *fromname, Inode *todir, const ch
     req->set_old_inode(oldinode);
     req->old_inode_drop = CEPH_CAP_LINK_SHARED;
 
-    res = _lookup(todir, toname, 0, &otherin, perm);
+    res = _lookup(todir, toname, 0, &otherin, perm, nullptr, true);
     switch (res) {
     case 0:
       {
@@ -14243,6 +14479,12 @@ int Client::_rename(Inode *fromdir, const char *fromname, Inode *todir, const ch
 
   res = make_request(req, perm, &target);
   ldout(cct, 10) << "rename result is " << res << dendl;
+
+  // if rename fails it will miss waking up the waiters
+  if (op == CEPH_MDS_OP_RENAME && de->is_renaming) {
+    de->is_renaming = false;
+    signal_cond_list(waiting_for_rename);
+  }
 
   // renamed item from our cache
 

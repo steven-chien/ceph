@@ -36,6 +36,11 @@ import { RgwMultisiteZoneFormComponent } from './rgw-multisite-zone-form/rgw-mul
 import { CrudFormComponent } from '~/app/shared/forms/crud-form/crud-form.component';
 import { RgwMultisiteZoneDeletionFormComponent } from './models/rgw-multisite-zone-deletion-form/rgw-multisite-zone-deletion-form.component';
 import { RgwMultisiteZonegroupDeletionFormComponent } from './models/rgw-multisite-zonegroup-deletion-form/rgw-multisite-zonegroup-deletion-form.component';
+import { RgwSystemUserComponent } from './rgw-system-user/rgw-system-user.component';
+import { RgwMultisiteMigrateComponent } from './rgw-multisite-migrate/rgw-multisite-migrate.component';
+import { RgwMultisiteImportComponent } from './rgw-multisite-import/rgw-multisite-import.component';
+import { RgwMultisiteExportComponent } from './rgw-multisite-export/rgw-multisite-export.component';
+import { CreateRgwServiceEntitiesComponent } from './create-rgw-service-entities/create-rgw-service-entities.component';
 
 @NgModule({
   imports: [
@@ -81,7 +86,12 @@ import { RgwMultisiteZonegroupDeletionFormComponent } from './models/rgw-multisi
     RgwMultisiteZonegroupFormComponent,
     RgwMultisiteZoneFormComponent,
     RgwMultisiteZoneDeletionFormComponent,
-    RgwMultisiteZonegroupDeletionFormComponent
+    RgwMultisiteZonegroupDeletionFormComponent,
+    RgwSystemUserComponent,
+    RgwMultisiteMigrateComponent,
+    RgwMultisiteImportComponent,
+    RgwMultisiteExportComponent,
+    CreateRgwServiceEntitiesComponent
   ]
 })
 export class RgwModule {}
@@ -90,7 +100,7 @@ const routes: Routes = [
   {
     path: '' // Required for a clean reload on daemon selection.
   },
-  { path: 'daemon', component: RgwDaemonListComponent, data: { breadcrumbs: 'Daemons' } },
+  { path: 'daemon', component: RgwDaemonListComponent, data: { breadcrumbs: 'Gateways' } },
   {
     path: 'user',
     data: { breadcrumbs: 'Users' },
@@ -105,36 +115,36 @@ const routes: Routes = [
         path: `${URLVerbs.EDIT}/:uid`,
         component: RgwUserFormComponent,
         data: { breadcrumbs: ActionLabels.EDIT }
+      }
+    ]
+  },
+  {
+    path: 'roles',
+    data: {
+      breadcrumbs: 'Roles',
+      resource: 'api.rgw.roles@1.0',
+      tabs: [
+        {
+          name: 'Users',
+          url: '/rgw/user'
+        },
+        {
+          name: 'Roles',
+          url: '/rgw/roles'
+        }
+      ]
+    },
+    children: [
+      {
+        path: '',
+        component: CRUDTableComponent
       },
       {
-        path: 'roles',
+        path: URLVerbs.CREATE,
+        component: CrudFormComponent,
         data: {
-          breadcrumbs: 'Roles',
-          resource: 'api.rgw.user.roles@1.0',
-          tabs: [
-            {
-              name: 'Users',
-              url: '/rgw/user'
-            },
-            {
-              name: 'Roles',
-              url: '/rgw/user/roles'
-            }
-          ]
-        },
-        children: [
-          {
-            path: '',
-            component: CRUDTableComponent
-          },
-          {
-            path: URLVerbs.CREATE,
-            component: CrudFormComponent,
-            data: {
-              breadcrumbs: ActionLabels.CREATE
-            }
-          }
-        ]
+          breadcrumbs: ActionLabels.CREATE
+        }
       }
     ]
   },

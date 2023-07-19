@@ -31,13 +31,31 @@ void create_debug_action(lua_State* L, CephContext* cct) {
   lua_setglobal(L, RGWDebugLogAction);
 }
 
+
 void stack_dump(lua_State* L) {
-  int top = lua_gettop(L);
+  const auto top = lua_gettop(L);
   std::cout << std::endl << " ----------------  Stack Dump ----------------" << std::endl;
   std::cout << "Stack Size: " << top << std::endl;
   for (int i = 1, j = -top; i <= top; i++, j++) {
-    std::cout << "[" << i << "," << j << "]: " << luaL_tolstring(L, i, NULL) << std::endl;
-    lua_pop(L, 1);
+		std::cout << "[" << i << "," << j << "][" << luaL_typename(L, i) << "]: ";
+    switch (lua_type(L, i)) {
+      case LUA_TNUMBER:
+        std::cout << lua_tonumber(L, i);
+        break;
+      case LUA_TSTRING:
+        std::cout << lua_tostring(L, i);
+        break;
+      case LUA_TBOOLEAN:
+        std::cout << (lua_toboolean(L, i) ? "true" : "false");
+        break;
+      case LUA_TNIL:
+        std::cout << "nil";
+        break;
+      default:
+        std::cout << lua_topointer(L, i);
+        break;
+    }
+		std::cout << std::endl;
   }
   std::cout << "--------------- Stack Dump Finished ---------------" << std::endl;
 }
@@ -50,11 +68,11 @@ void set_package_path(lua_State* L, const std::string& install_dir) {
   if (!lua_istable(L, -1)) {
     return;
   }
-  const auto path = install_dir+"/share/lua/"+CEPH_LUA_VERSION+"/?.lua";  
+  const auto path = install_dir+"/share/lua/"+CEPH_LUA_VERSION+"/?.lua";
   pushstring(L, path);
   lua_setfield(L, -2, "path");
   
-  const auto cpath = install_dir+"/lib/lua/"+CEPH_LUA_VERSION+"/?.so";
+  const auto cpath = install_dir+"/lib/lua/"+CEPH_LUA_VERSION+"/?.so;"+install_dir+"/lib64/lua/"+CEPH_LUA_VERSION+"/?.so";
   pushstring(L, cpath);
   lua_setfield(L, -2, "cpath");
 }

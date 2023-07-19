@@ -75,7 +75,8 @@ static seastar::future<> test_echo(unsigned rounds,
                              const std::string& lname,
                              const uint64_t nonce,
                              const entity_addr_t& addr) {
-        msgr = crimson::net::Messenger::create(name, lname, nonce);
+        msgr = crimson::net::Messenger::create(
+            name, lname, nonce, true);
         msgr->set_default_policy(crimson::net::SocketPolicy::stateless_server(0));
         msgr->set_auth_client(&dummy_auth);
         msgr->set_auth_server(&dummy_auth);
@@ -123,7 +124,10 @@ static seastar::future<> test_echo(unsigned rounds,
         return found->second;
       }
 
-      void ms_handle_connect(crimson::net::ConnectionRef conn) override {
+      void ms_handle_connect(
+          crimson::net::ConnectionRef conn,
+          seastar::shard_id new_shard) override {
+        assert(new_shard == seastar::this_shard_id());
         auto session = seastar::make_shared<PingSession>();
         auto [i, added] = sessions.emplace(conn, session);
         std::ignore = i;
@@ -151,7 +155,8 @@ static seastar::future<> test_echo(unsigned rounds,
       seastar::future<> init(const entity_name_t& name,
                              const std::string& lname,
                              const uint64_t nonce) {
-        msgr = crimson::net::Messenger::create(name, lname, nonce);
+        msgr = crimson::net::Messenger::create(
+            name, lname, nonce, true);
         msgr->set_default_policy(crimson::net::SocketPolicy::lossy_client(0));
         msgr->set_auth_client(&dummy_auth);
         msgr->set_auth_server(&dummy_auth);
@@ -300,7 +305,8 @@ static seastar::future<> test_concurrent_dispatch()
                              const std::string& lname,
                              const uint64_t nonce,
                              const entity_addr_t& addr) {
-        msgr = crimson::net::Messenger::create(name, lname, nonce);
+        msgr = crimson::net::Messenger::create(
+            name, lname, nonce, true);
         msgr->set_default_policy(crimson::net::SocketPolicy::stateless_server(0));
         msgr->set_auth_client(&dummy_auth);
         msgr->set_auth_server(&dummy_auth);
@@ -328,7 +334,8 @@ static seastar::future<> test_concurrent_dispatch()
       seastar::future<> init(const entity_name_t& name,
                              const std::string& lname,
                              const uint64_t nonce) {
-        msgr = crimson::net::Messenger::create(name, lname, nonce);
+        msgr = crimson::net::Messenger::create(
+            name, lname, nonce, true);
         msgr->set_default_policy(crimson::net::SocketPolicy::lossy_client(0));
         msgr->set_auth_client(&dummy_auth);
         msgr->set_auth_server(&dummy_auth);
@@ -389,7 +396,8 @@ seastar::future<> test_preemptive_shutdown() {
                              const std::string& lname,
                              const uint64_t nonce,
                              const entity_addr_t& addr) {
-        msgr = crimson::net::Messenger::create(name, lname, nonce);
+        msgr = crimson::net::Messenger::create(
+            name, lname, nonce, true);
         msgr->set_default_policy(crimson::net::SocketPolicy::stateless_server(0));
         msgr->set_auth_client(&dummy_auth);
         msgr->set_auth_server(&dummy_auth);
@@ -428,7 +436,8 @@ seastar::future<> test_preemptive_shutdown() {
       seastar::future<> init(const entity_name_t& name,
                              const std::string& lname,
                              const uint64_t nonce) {
-        msgr = crimson::net::Messenger::create(name, lname, nonce);
+        msgr = crimson::net::Messenger::create(
+            name, lname, nonce, true);
         msgr->set_default_policy(crimson::net::SocketPolicy::lossy_client(0));
         msgr->set_auth_client(&dummy_auth);
         msgr->set_auth_server(&dummy_auth);
@@ -550,8 +559,8 @@ struct ConnResult {
   unsigned cnt_reset_dispatched = 0;
   unsigned cnt_remote_reset_dispatched = 0;
 
-  ConnResult(Connection& conn, unsigned index)
-    : conn(conn.shared_from_this()), index(index) {}
+  ConnResult(ConnectionRef conn, unsigned index)
+    : conn(conn), index(index) {}
 
   template <typename T>
   void _assert_eq(const char* expr_actual, T actual,
@@ -697,18 +706,24 @@ struct TestInterceptor : public Interceptor {
   }
 
  private:
-  void register_conn(Connection& conn) override {
+  void register_conn(ConnectionRef conn) override {
+    auto result = find_result(conn);
+    if (result != nullptr) {
+      logger().error("The connection [{}] {} already exists when register {}",
+                     result->index, *result->conn, *conn);
+      ceph_abort();
+    }
     unsigned index = results.size();
     results.emplace_back(conn, index);
-    conns[conn.shared_from_this()] = index;
+    conns[conn] = index;
     notify();
-    logger().info("[{}] {} new connection registered", index, conn);
+    logger().info("[{}] {} new connection registered", index, *conn);
   }
 
-  void register_conn_closed(Connection& conn) override {
-    auto result = find_result(conn.shared_from_this());
+  void register_conn_closed(ConnectionRef conn) override {
+    auto result = find_result(conn);
     if (result == nullptr) {
-      logger().error("Untracked closed connection: {}", conn);
+      logger().error("Untracked closed connection: {}", *conn);
       ceph_abort();
     }
 
@@ -716,39 +731,39 @@ struct TestInterceptor : public Interceptor {
       result->state = conn_state_t::closed;
     }
     notify();
-    logger().info("[{}] {} closed({})", result->index, conn, result->state);
+    logger().info("[{}] {} closed({})", result->index, *conn, result->state);
   }
 
-  void register_conn_ready(Connection& conn) override {
-    auto result = find_result(conn.shared_from_this());
+  void register_conn_ready(ConnectionRef conn) override {
+    auto result = find_result(conn);
     if (result == nullptr) {
-      logger().error("Untracked ready connection: {}", conn);
+      logger().error("Untracked ready connection: {}", *conn);
       ceph_abort();
     }
 
-    ceph_assert(conn.is_connected());
+    ceph_assert(conn->is_connected());
     notify();
-    logger().info("[{}] {} ready", result->index, conn);
+    logger().info("[{}] {} ready", result->index, *conn);
   }
 
-  void register_conn_replaced(Connection& conn) override {
-    auto result = find_result(conn.shared_from_this());
+  void register_conn_replaced(ConnectionRef conn) override {
+    auto result = find_result(conn);
     if (result == nullptr) {
-      logger().error("Untracked replaced connection: {}", conn);
+      logger().error("Untracked replaced connection: {}", *conn);
       ceph_abort();
     }
 
     result->state = conn_state_t::replaced;
-    logger().info("[{}] {} {}", result->index, conn, result->state);
+    logger().info("[{}] {} {}", result->index, *conn, result->state);
   }
 
-  bp_action_t intercept(Connection& conn, Breakpoint bp) override {
+  bp_action_t intercept(ConnectionRef conn, Breakpoint bp) override {
     ++breakpoints_counter[bp].counter;
 
-    auto result = find_result(conn.shared_from_this());
+    auto result = find_result(conn);
     if (result == nullptr) {
       logger().error("Untracked intercepted connection: {}, at breakpoint {}({})",
-                     conn, bp, breakpoints_counter[bp].counter);
+                     *conn, bp, breakpoints_counter[bp].counter);
       ceph_abort();
     }
 
@@ -777,13 +792,13 @@ struct TestInterceptor : public Interceptor {
       auto it_cnt = it_bp->second.find(breakpoints_counter[bp].counter);
       if (it_cnt != it_bp->second.end()) {
         logger().info("[{}] {} intercepted {}({}) => {}",
-                      result->index, conn, bp,
+                      result->index, *conn, bp,
                       breakpoints_counter[bp].counter, it_cnt->second);
         return it_cnt->second;
       }
     }
     logger().info("[{}] {} intercepted {}({})",
-                  result->index, conn, bp, breakpoints_counter[bp].counter);
+                  result->index, *conn, bp, breakpoints_counter[bp].counter);
     return bp_action_t::CONTINUE;
   }
 };
@@ -845,7 +860,11 @@ class FailoverSuite : public Dispatcher {
     return {seastar::now()};
   }
 
-  void ms_handle_accept(ConnectionRef conn) override {
+  void ms_handle_accept(
+      ConnectionRef conn,
+      seastar::shard_id new_shard,
+      bool is_replace) override {
+    assert(new_shard == seastar::this_shard_id());
     auto result = interceptor.find_result(conn);
     if (result == nullptr) {
       logger().error("Untracked accepted connection: {}", *conn);
@@ -868,7 +887,10 @@ class FailoverSuite : public Dispatcher {
     std::ignore = flush_pending_send();
   }
 
-  void ms_handle_connect(ConnectionRef conn) override {
+  void ms_handle_connect(
+      ConnectionRef conn,
+      seastar::shard_id new_shard) override {
+    assert(new_shard == seastar::this_shard_id());
     auto result = interceptor.find_result(conn);
     if (result == nullptr) {
       logger().error("Untracked connected connection: {}", *conn);
@@ -1105,7 +1127,11 @@ class FailoverSuite : public Dispatcher {
          entity_addr_t test_peer_addr,
          const TestInterceptor& interceptor) {
     auto suite = std::make_unique<FailoverSuite>(
-        Messenger::create(entity_name_t::OSD(TEST_OSD), "Test", TEST_NONCE),
+        Messenger::create(
+          entity_name_t::OSD(TEST_OSD),
+          "Test",
+          TEST_NONCE,
+          true),
         test_peer_addr, interceptor);
     return suite->init(test_addr, test_policy
     ).then([suite = std::move(suite)] () mutable {
@@ -1319,7 +1345,11 @@ class FailoverTest : public Dispatcher {
          entity_addr_t cmd_peer_addr,
          entity_addr_t test_peer_addr) {
     auto test = seastar::make_lw_shared<FailoverTest>(
-        Messenger::create(entity_name_t::OSD(CMD_CLI_OSD), "CmdCli", CMD_CLI_NONCE),
+        Messenger::create(
+          entity_name_t::OSD(CMD_CLI_OSD),
+          "CmdCli",
+          CMD_CLI_NONCE,
+          true),
         test_addr, test_peer_addr);
     return test->init(cmd_peer_addr).then([test] {
       logger().info("CmdCli ready");
@@ -1426,7 +1456,11 @@ class FailoverSuitePeer : public Dispatcher {
     return {seastar::now()};
   }
 
-  void ms_handle_accept(ConnectionRef conn) override {
+  void ms_handle_accept(
+      ConnectionRef conn,
+      seastar::shard_id new_shard,
+      bool is_replace) override {
+    assert(new_shard == seastar::this_shard_id());
     logger().info("[TestPeer] got accept from Test");
     ceph_assert(!tracked_conn ||
                 tracked_conn->is_closed() ||
@@ -1536,7 +1570,8 @@ class FailoverSuitePeer : public Dispatcher {
       Messenger::create(
         entity_name_t::OSD(TEST_PEER_OSD),
         "TestPeer",
-        TEST_PEER_NONCE),
+        TEST_PEER_NONCE,
+        true),
       op_callback
     );
     return suite->init(test_peer_addr, policy
@@ -1581,7 +1616,11 @@ class FailoverTestPeer : public Dispatcher {
     return {seastar::now()};
   }
 
-  void ms_handle_accept(ConnectionRef conn) override {
+  void ms_handle_accept(
+      ConnectionRef conn,
+      seastar::shard_id new_shard,
+      bool is_replace) override {
+    assert(new_shard == seastar::this_shard_id());
     cmd_conn = conn;
   }
 
@@ -1658,7 +1697,11 @@ class FailoverTestPeer : public Dispatcher {
   static seastar::future<std::unique_ptr<FailoverTestPeer>>
   create(entity_addr_t cmd_peer_addr, entity_addr_t test_peer_addr) {
     auto test_peer = std::make_unique<FailoverTestPeer>(
-        Messenger::create(entity_name_t::OSD(CMD_SRV_OSD), "CmdSrv", CMD_SRV_NONCE),
+        Messenger::create(
+          entity_name_t::OSD(CMD_SRV_OSD),
+          "CmdSrv",
+          CMD_SRV_NONCE,
+          true),
         test_peer_addr);
     return test_peer->init(cmd_peer_addr
     ).then([test_peer = std::move(test_peer)] () mutable {

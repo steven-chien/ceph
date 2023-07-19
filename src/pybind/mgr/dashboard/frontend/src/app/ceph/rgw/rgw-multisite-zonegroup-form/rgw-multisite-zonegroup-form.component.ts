@@ -137,9 +137,20 @@ export class RgwMultisiteZonegroupFormComponent implements OnInit {
     this.zonegroupNames = this.zonegroupList.map((zonegroup) => {
       return zonegroup['name'];
     });
+    let allZonegroupZonesList = this.zonegroupList.map((zonegroup: RgwZonegroup) => {
+      return zonegroup['zones'];
+    });
+    const allZonegroupZonesInfo = allZonegroupZonesList.reduce(
+      (accumulator, value) => accumulator.concat(value),
+      []
+    );
+    const allZonegroupZonesNames = allZonegroupZonesInfo.map((zone) => {
+      return zone['name'];
+    });
     this.allZoneNames = this.zoneList.map((zone: RgwZone) => {
       return zone['name'];
     });
+    this.allZoneNames = _.difference(this.allZoneNames, allZonegroupZonesNames);
     if (this.action === 'create' && this.defaultsInfo['defaultRealmName'] !== null) {
       this.multisiteZonegroupForm
         .get('selectedRealm')
@@ -206,7 +217,7 @@ export class RgwMultisiteZonegroupFormComponent implements OnInit {
       this.realm.name = values['selectedRealm'];
       this.zonegroup = new RgwZonegroup();
       this.zonegroup.name = values['zonegroupName'];
-      this.zonegroup.endpoints = this.checkUrlArray(values['zonegroup_endpoints']);
+      this.zonegroup.endpoints = values['zonegroup_endpoints'];
       this.rgwZonegroupService
         .create(this.realm, this.zonegroup, values['default_zonegroup'], values['master_zonegroup'])
         .subscribe(
@@ -237,10 +248,7 @@ export class RgwMultisiteZonegroupFormComponent implements OnInit {
       this.zonegroup = new RgwZonegroup();
       this.zonegroup.name = this.info.data.name;
       this.newZonegroupName = values['zonegroupName'];
-      this.zonegroup.endpoints =
-        values['zonegroup_endpoints'] === this.info.data.endpoints
-          ? values['zonegroup_endpoints']
-          : this.checkUrlArray(values['zonegroup_endpoints']);
+      this.zonegroup.endpoints = values['zonegroup_endpoints'];
       this.zonegroup.placement_targets = values['placementTargets'];
       this.rgwZonegroupService
         .update(
